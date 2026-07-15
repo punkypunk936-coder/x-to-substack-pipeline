@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>X Article to Substack</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <p class="kicker">Manvinder writing pipe</p>
+      <h1>X to Substack</h1>
+      <p class="subcopy">Turn an X article into a reviewable Substack draft, refine it here, or publish the saved version directly.</p>
+    </section>
+
+    <section class="panel">
+      <label for="xUrl">X article URL</label>
+      <div class="url-row">
+        <input id="xUrl" placeholder="https://x.com/.../status/..." autocomplete="off" autofocus>
+        <button id="ingestButton">Create draft</button>
+      </div>
+      <p id="statusLine" class="status">Waiting for an X article link.</p>
+    </section>
+
+    <section id="workspace" class="workspace hidden">
+      <aside class="draft-inbox" aria-label="Article drafts">
+        <div class="inbox-header">
+          <div>
+            <p class="kicker">Draft pipeline</p>
+            <p id="accountLabel" class="account-label">@0xgoodie</p>
+          </div>
+          <button id="syncButton" type="button" class="sync-button" title="Check X and Substack">Sync all</button>
+        </div>
+        <div id="draftList" class="draft-list"></div>
+        <p id="syncLine" class="sync-line">Waiting for first sync.</p>
+      </aside>
+
+      <section id="result" class="result">
+      <div>
+        <p class="kicker">Current draft</p>
+        <h2 id="draftTitle"></h2>
+        <p id="draftSubtitle" class="muted"></p>
+        <p id="draftMeta" class="meta"></p>
+      </div>
+      <div class="actions">
+        <button id="substackDraftButton" class="secondary-button">Open in Substack</button>
+        <button id="publishButton" class="danger-button">Publish now</button>
+      </div>
+      <div class="workspace-tabs" role="tablist" aria-label="Draft view">
+        <button id="editTab" type="button" class="workspace-tab active" role="tab" aria-selected="true">Edit</button>
+        <button id="previewTab" type="button" class="workspace-tab" role="tab" aria-selected="false">Preview</button>
+      </div>
+      <form id="editor" class="editor">
+        <div class="field-row">
+          <div>
+            <label for="editTitle">Title</label>
+            <input id="editTitle" maxlength="240">
+          </div>
+          <div>
+            <label for="editSubtitle">Subtitle</label>
+            <input id="editSubtitle" maxlength="500" placeholder="Optional">
+          </div>
+        </div>
+        <label for="editBody">Article body</label>
+        <textarea id="editBody" spellcheck="true"></textarea>
+        <div class="editor-footer">
+          <p id="editMeta" class="meta"></p>
+          <div class="editor-actions">
+            <button id="cancelEdit" type="button" class="secondary-button">Reset</button>
+            <button id="saveDraft" type="submit">Save changes</button>
+          </div>
+        </div>
+      </form>
+      <article id="inlinePreview" class="inline-preview hidden">
+        <p class="preview-kicker">manvinder’s Substack</p>
+        <h1 id="previewTitle"></h1>
+        <p id="previewSubtitle" class="preview-subtitle"></p>
+        <div id="previewBody" class="preview-body"></div>
+      </article>
+      <p id="publishLine" class="publish-status"></p>
+      <p id="warningLine" class="warning"></p>
+      </section>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

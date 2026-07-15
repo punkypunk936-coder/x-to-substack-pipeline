@@ -1,0 +1,15 @@
+.x-profile/
+.substack-profile/
+.env
+__pycache__/
+*.pyc
+data/current_draft.json
+data/publish_payload.json
+data/publish_result.json
+data/x_extract_result.json
+data/draft_pipeline.json
+data/sync_state.json
+dist/draft.html
+dist/substack-import.csv
+dist/feed.xml
+content/articles/*.md
