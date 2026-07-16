@@ -91,6 +91,41 @@ class RichDraftTests(unittest.TestCase):
         self.assertGreaterEqual(score, 0.88)
         self.assertEqual(server.title_match_score("Trading apps", "India's tech-nomy"), 0.0)
 
+    def test_archive_api_fills_rss_publication_lag(self) -> None:
+        previous_feed_fetch = server.fetch_substack_feed_publications
+        previous_archive_fetch = server.fetch_substack_archive_publications
+        try:
+            server.fetch_substack_feed_publications = lambda: [
+                {
+                    "title": "Older published post",
+                    "url": "https://example.substack.com/p/older",
+                    "published_at": "2026-07-15T08:00:00+00:00",
+                    "source": "rss",
+                }
+            ]
+            server.fetch_substack_archive_publications = lambda: [
+                {
+                    "title": "Newest published post",
+                    "url": "https://example.substack.com/p/newest",
+                    "published_at": "2026-07-16T08:22:11+00:00",
+                    "source": "archive_api",
+                },
+                {
+                    "title": "Older published post",
+                    "url": "https://example.substack.com/p/older",
+                    "published_at": "2026-07-15T08:00:00+00:00",
+                    "source": "archive_api",
+                },
+            ]
+
+            publications = server.fetch_substack_publications()
+
+            self.assertEqual([post["title"] for post in publications], ["Newest published post", "Older published post"])
+            self.assertEqual(publications[1]["source"], "archive_api")
+        finally:
+            server.fetch_substack_feed_publications = previous_feed_fetch
+            server.fetch_substack_archive_publications = previous_archive_fetch
+
     def test_reconciliation_retires_published_selection(self) -> None:
         previous_pipeline_path = server.DRAFT_PIPELINE_JSON
         previous_fetch = server.fetch_substack_publications
@@ -133,6 +168,46 @@ class RichDraftTests(unittest.TestCase):
                 self.assertEqual(pipeline["selected_id"], "201")
                 self.assertEqual(pipeline["items"][0]["status"], "published")
                 self.assertEqual(pipeline["items"][0]["substack_url"], "https://manvinder.substack.com/p/everyones-a-trader")
+        finally:
+            server.DRAFT_PIPELINE_JSON = previous_pipeline_path
+            server.fetch_substack_publications = previous_fetch
+
+    def test_reconciliation_does_not_reannounce_published_posts(self) -> None:
+        previous_pipeline_path = server.DRAFT_PIPELINE_JSON
+        previous_fetch = server.fetch_substack_publications
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                server.DRAFT_PIPELINE_JSON = Path(directory) / "pipeline.json"
+                server.DRAFT_PIPELINE_JSON.write_text(
+                    json.dumps(
+                        {
+                            "selected_id": None,
+                            "items": [
+                                {
+                                    "id": "200",
+                                    "title": "Already published",
+                                    "date": "2026-07-16",
+                                    "status": "published",
+                                    "substack_url": "https://example.substack.com/p/already-published",
+                                    "published_at": "2026-07-16T08:22:11+00:00",
+                                }
+                            ],
+                        }
+                    )
+                )
+                server.fetch_substack_publications = lambda: [
+                    {
+                        "title": "Already published",
+                        "url": "https://example.substack.com/p/already-published",
+                        "published_at": "2026-07-16T08:22:11.316Z",
+                        "source": "archive_api",
+                    }
+                ]
+
+                result = server.reconcile_substack_publications()
+
+                self.assertEqual(result["updated"], [])
+                self.assertFalse(result["changed"])
         finally:
             server.DRAFT_PIPELINE_JSON = previous_pipeline_path
             server.fetch_substack_publications = previous_fetch

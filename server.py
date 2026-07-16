@@ -1229,7 +1229,19 @@ def substack_feed_url() -> str:
     return f"{parsed.scheme}://{parsed.netloc}/feed" if parsed.scheme and parsed.netloc else ""
 
 
-def fetch_substack_publications() -> List[Dict[str, Any]]:
+def substack_archive_api_url() -> str:
+    configured = os.environ.get("SUBSTACK_ARCHIVE_API_URL") or ""
+    if configured:
+        return configured
+    feed_url = substack_feed_url()
+    parsed = urllib.parse.urlparse(feed_url)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    query = urllib.parse.urlencode({"sort": "new", "search": "", "offset": 0, "limit": 50})
+    return f"{parsed.scheme}://{parsed.netloc}/api/v1/archive?{query}"
+
+
+def fetch_substack_feed_publications() -> List[Dict[str, Any]]:
     feed_url = substack_feed_url()
     if not feed_url:
         raise ValueError("SUBSTACK_FEED_URL is not configured.")
@@ -1247,7 +1259,73 @@ def fetch_substack_publications() -> List[Dict[str, Any]]:
                 published_at = email.utils.parsedate_to_datetime(published).isoformat()
             except (TypeError, ValueError):
                 published_at = published
-        publications.append({"title": title, "url": link, "published_at": published_at})
+        publications.append({"title": title, "url": link, "published_at": published_at, "source": "rss"})
+    return publications
+
+
+def fetch_substack_archive_publications() -> List[Dict[str, Any]]:
+    archive_url = substack_archive_api_url()
+    if not archive_url:
+        raise ValueError("Substack archive API URL is not configured.")
+    payload = request_json(archive_url)
+    raw_posts = payload if isinstance(payload, list) else payload.get("posts") if isinstance(payload, dict) else []
+    if not isinstance(raw_posts, list):
+        raise ValueError("Substack archive API returned an unexpected response.")
+    publications: List[Dict[str, Any]] = []
+    for post in raw_posts:
+        if not isinstance(post, dict):
+            continue
+        title = str(post.get("title") or "").strip()
+        url = str(post.get("canonical_url") or "").strip()
+        if not url and post.get("slug"):
+            parsed = urllib.parse.urlparse(archive_url)
+            url = f"{parsed.scheme}://{parsed.netloc}/p/{urllib.parse.quote(str(post['slug']))}"
+        published_at = str(post.get("post_date") or post.get("published_at") or "").strip() or None
+        if not title or not url or str(post.get("audience") or "everyone") != "everyone":
+            continue
+        publications.append(
+            {
+                "title": title,
+                "url": url,
+                "published_at": published_at,
+                "source": "archive_api",
+            }
+        )
+    return publications
+
+
+def merge_substack_publications(*sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for publications in sources:
+        for post in publications:
+            url = str(post.get("url") or "").split("?", 1)[0].rstrip("/")
+            if not url:
+                continue
+            existing = merged.get(url)
+            if existing is None or post.get("source") == "archive_api":
+                merged[url] = dict(post)
+    return sorted(
+        merged.values(),
+        key=lambda post: str(post.get("published_at") or ""),
+        reverse=True,
+    )
+
+
+def fetch_substack_publications() -> List[Dict[str, Any]]:
+    feed_posts: List[Dict[str, Any]] = []
+    archive_posts: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    try:
+        feed_posts = fetch_substack_feed_publications()
+    except Exception as exc:
+        errors.append(f"RSS: {exc}")
+    try:
+        archive_posts = fetch_substack_archive_publications()
+    except Exception as exc:
+        errors.append(f"Archive: {exc}")
+    publications = merge_substack_publications(feed_posts, archive_posts)
+    if not publications:
+        raise ValueError("Could not read published Substack posts. " + " ".join(errors))
     return publications
 
 
@@ -1312,9 +1390,15 @@ def reconcile_substack_publications() -> Dict[str, Any]:
                     "method": method,
                     "score": score,
                     "url": post.get("url"),
+                    "source": post.get("source"),
                 }
             )
-            next_published_at = post.get("published_at") or item.get("published_at") or now_iso()
+            already_linked = item.get("status") == "published" and item.get("substack_url") == post["url"]
+            next_published_at = (
+                item.get("published_at")
+                if already_linked and item.get("published_at")
+                else post.get("published_at") or item.get("published_at") or now_iso()
+            )
             if (
                 item.get("status") != "published"
                 or item.get("substack_url") != post["url"]

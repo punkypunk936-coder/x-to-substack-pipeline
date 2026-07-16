@@ -854,6 +854,20 @@ async function loadCurrent() {
   window.setTimeout(() => syncDrafts({ silent: true }), 800);
 }
 
+async function refreshPipelineState() {
+  if (editorDirty) return;
+  try {
+    const pipeline = await api("/api/drafts");
+    renderPipeline(pipeline);
+    if (
+      pipeline.selected_id
+      && String(currentDraft?.id || "") !== String(pipeline.selected_id)
+    ) {
+      await openDraft(pipeline.selected_id);
+    }
+  } catch {}
+}
+
 $("#blockEditor").addEventListener("dragover", (event) => {
   if (!draggedBlockId) return;
   event.preventDefault();
@@ -920,4 +934,6 @@ window.addEventListener("beforeunload", (event) => {
   event.preventDefault();
 });
 
-loadCurrent().catch((error) => setStatus(error.message, "error"));
+loadCurrent()
+  .then(() => window.setInterval(refreshPipelineState, 15000))
+  .catch((error) => setStatus(error.message, "error"));
