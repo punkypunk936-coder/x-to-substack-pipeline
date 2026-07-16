@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { draftBodyHtml, draftPlainText, imageCount } from "./rich_draft.mjs";
 
 const execFileAsync = promisify(execFile);
 const payloadPath = process.argv[2];
@@ -16,36 +17,13 @@ function finish(result, code = 0) {
   process.exit(code);
 }
 
-function htmlEscape(value) {
-  return String(value || "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
-}
-
-function draftHtml(draft) {
-  const body = String(draft.body || "")
-    .split(/\n{2,}/)
-    .filter(Boolean)
-    .map((paragraph) => paragraph.startsWith("## ")
-      ? `<h2>${htmlEscape(paragraph.slice(3))}</h2>`
-      : `<p>${htmlEscape(paragraph).replaceAll("\n", "<br>")}</p>`)
-    .join("");
-  const media = (draft.media || [])
-    .map((item) => item.url
-      ? `<figure><img src="${htmlEscape(item.url)}" alt="${htmlEscape(item.alt || "X media")}"></figure>`
-      : "")
-    .join("");
-  return `${body}${media}`;
-}
-
 function injectionSource(draft) {
   const payload = JSON.stringify({
     title: draft.title || "Untitled X article",
     subtitle: draft.subtitle || "",
-    bodyText: draft.body || "",
-    bodyHtml: draftHtml(draft),
+    bodyText: draftPlainText(draft),
+    bodyHtml: draftBodyHtml(draft),
+    expectedImages: imageCount(draft),
   });
   return `(() => {
     const draft = ${payload};
@@ -120,7 +98,9 @@ function injectionSource(draft) {
       title_found: !!title,
       subtitle_found: !!subtitle,
       body_found: !!body,
-      body_chars: (body.innerText || "").trim().length
+      body_chars: (body.innerText || "").trim().length,
+      image_count: body.querySelectorAll("img").length,
+      expected_images: draft.expectedImages
     });
   })()`;
 }
@@ -132,7 +112,6 @@ on run argv
   set jsPath to item 2 of argv
   set jsSource to read POSIX file jsPath as «class utf8»
   tell application ${JSON.stringify(appName)}
-    activate
     if (count of windows) = 0 then make new window
     set targetWindow to front window
     make new tab at end of tabs of targetWindow with properties {URL:targetUrl}
@@ -145,8 +124,8 @@ on run argv
     end repeat
     delay 2
     execute targetTab javascript jsSource
-    delay 4
-    return execute targetTab javascript "(() => { const body = document.querySelector('[data-x-substack-bridge-body]'); const title = Array.from(document.querySelectorAll('textarea,input,[contenteditable]')).find((el) => /title/i.test((el.getAttribute('placeholder') || '') + ' ' + (el.getAttribute('data-placeholder') || ''))); return JSON.stringify({ ok: !!title && !!body && (body.innerText || '').trim().length > 0, status: 'draft_populated_existing_chrome', current_url: location.href, title_found: !!title, subtitle_found: !!Array.from(document.querySelectorAll('textarea,input,[contenteditable]')).find((el) => /subtitle/i.test((el.getAttribute('placeholder') || '') + ' ' + (el.getAttribute('data-placeholder') || ''))), body_found: !!body, body_chars: body ? (body.innerText || '').trim().length : 0 }); })()"
+    delay 7
+    return execute targetTab javascript "(() => { const body = document.querySelector('[data-x-substack-bridge-body]'); const title = Array.from(document.querySelectorAll('textarea,input,[contenteditable]')).find((el) => /title/i.test((el.getAttribute('placeholder') || '') + ' ' + (el.getAttribute('data-placeholder') || ''))); return JSON.stringify({ ok: !!title && !!body && ((body.innerText || '').trim().length > 0 || body.querySelectorAll('img').length > 0), status: 'draft_populated_existing_chrome', current_url: location.href, title_found: !!title, subtitle_found: !!Array.from(document.querySelectorAll('textarea,input,[contenteditable]')).find((el) => /subtitle/i.test((el.getAttribute('placeholder') || '') + ' ' + (el.getAttribute('data-placeholder') || ''))), body_found: !!body, body_chars: body ? (body.innerText || '').trim().length : 0, image_count: body ? body.querySelectorAll('img').length : 0 }); })()"
   end tell
 end run
 `;
@@ -182,10 +161,20 @@ try {
   });
   const result = JSON.parse(stdout.trim());
   if (!result.ok) finish({ ...result, message: "Substack opened, but the editor fields were not found." }, 4);
+  const expectedImages = imageCount(draft);
+  if (expectedImages > 0 && Number(result.image_count || 0) < expectedImages) {
+    finish({
+      ...result,
+      ok: false,
+      status: "media_transfer_incomplete",
+      expected_images: expectedImages,
+      message: "Substack did not accept every image, so publishing was stopped before anything went live.",
+    }, 4);
+  }
   if (!(confirmPublish && allowAutopublish)) {
     finish({
       ...result,
-      message: "Draft populated in your logged-in Chrome/Substack editor. Review it there; live publishing remains off.",
+      message: "Rich Substack draft saved in the background. Keep editing or publish from the dashboard.",
     });
   }
   const publishResult = await execFileAsync("osascript", ["-e", publishAppleScript(browserApp)], {

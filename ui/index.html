@@ -44,7 +44,7 @@
         <p id="draftMeta" class="meta"></p>
       </div>
       <div class="actions">
-        <button id="substackDraftButton" class="secondary-button">Open in Substack</button>
+        <button id="substackDraftButton" class="secondary-button">Save to Substack</button>
         <button id="publishButton" class="danger-button">Publish now</button>
       </div>
       <div class="workspace-tabs" role="tablist" aria-label="Draft view">
@@ -62,10 +62,38 @@
             <input id="editSubtitle" maxlength="500" placeholder="Optional">
           </div>
         </div>
-        <label for="editBody">Article body</label>
-        <textarea id="editBody" spellcheck="true"></textarea>
+        <div class="editor-toolbar" role="toolbar" aria-label="Article formatting">
+          <div class="toolbar-group" aria-label="Inline formatting">
+            <button type="button" class="tool-button format-button" data-command="bold" title="Bold" aria-label="Bold"><strong>B</strong></button>
+            <button type="button" class="tool-button format-button" data-command="italic" title="Italic" aria-label="Italic"><em>I</em></button>
+            <button type="button" class="tool-button format-button" data-command="underline" title="Underline" aria-label="Underline"><u>U</u></button>
+            <button type="button" class="tool-button format-button" data-command="strikeThrough" title="Strikethrough" aria-label="Strikethrough"><s>S</s></button>
+            <button id="linkButton" type="button" class="tool-button" title="Add link" aria-label="Add link">Link</button>
+          </div>
+          <div class="toolbar-group" aria-label="Insert content">
+            <button id="imageButton" type="button" class="tool-button labeled-tool" title="Insert image">Image</button>
+            <button id="embedButton" type="button" class="tool-button labeled-tool" title="Insert media link">Embed</button>
+            <button id="dividerButton" type="button" class="tool-button labeled-tool" title="Insert divider">Divider</button>
+          </div>
+        </div>
+        <div id="blockEditor" class="block-editor" aria-label="Article body"></div>
+        <div class="add-block-row">
+          <select id="blockTypeSelect" aria-label="Block type">
+            <option value="paragraph">Paragraph</option>
+            <option value="heading">Heading</option>
+            <option value="subheading">Subheading</option>
+            <option value="quote">Quote</option>
+            <option value="bullet_list">Bulleted list</option>
+            <option value="numbered_list">Numbered list</option>
+            <option value="code">Code</option>
+          </select>
+          <button id="addBlockButton" type="button" class="secondary-button">Add block</button>
+        </div>
         <div class="editor-footer">
-          <p id="editMeta" class="meta"></p>
+          <div>
+            <p id="editMeta" class="meta"></p>
+            <p id="saveState" class="save-state">Saved locally</p>
+          </div>
           <div class="editor-actions">
             <button id="cancelEdit" type="button" class="secondary-button">Reset</button>
             <button id="saveDraft" type="submit">Save changes</button>
@@ -83,6 +111,53 @@
       </section>
     </section>
   </main>
+
+  <dialog id="mediaDialog" class="media-dialog">
+    <form id="mediaForm" class="dialog-form">
+      <div class="dialog-header">
+        <div>
+          <p class="kicker">Media block</p>
+          <h2>Insert image</h2>
+        </div>
+        <button id="closeMediaDialog" type="button" class="tool-button" aria-label="Close" title="Close">X</button>
+      </div>
+      <div class="media-tabs" role="tablist" aria-label="Image source">
+        <button id="uploadMediaTab" type="button" class="media-tab active" role="tab" aria-selected="true">Upload</button>
+        <button id="urlMediaTab" type="button" class="media-tab" role="tab" aria-selected="false">From URL</button>
+      </div>
+      <div id="uploadMediaPanel" class="media-source-panel">
+        <label class="file-picker" for="mediaFile">
+          <strong>Choose image</strong>
+          <span id="mediaFileName">PNG, JPEG, WebP, or GIF</span>
+        </label>
+        <input id="mediaFile" class="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif">
+      </div>
+      <div id="urlMediaPanel" class="media-source-panel hidden">
+        <label for="mediaUrl">Image URL</label>
+        <input id="mediaUrl" type="url" placeholder="https://...">
+      </div>
+      <div class="dialog-field-grid">
+        <div>
+          <label for="mediaAlt">Alt text</label>
+          <input id="mediaAlt" maxlength="500" placeholder="Describe the image">
+        </div>
+        <div>
+          <label for="mediaLayout">Layout</label>
+          <select id="mediaLayout">
+            <option value="regular">Regular</option>
+            <option value="wide">Wide</option>
+            <option value="full">Full width</option>
+          </select>
+        </div>
+      </div>
+      <label for="mediaCaption">Caption</label>
+      <input id="mediaCaption" maxlength="500" placeholder="Optional">
+      <div class="dialog-actions">
+        <button id="cancelMedia" type="button" class="secondary-button">Cancel</button>
+        <button id="insertMedia" type="submit">Insert image</button>
+      </div>
+    </form>
+  </dialog>
   <script src="/app.js"></script>
 </body>
 </html>

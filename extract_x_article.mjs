@@ -144,6 +144,8 @@ try {
         height: String(img.naturalHeight || ""),
       }))
       .filter((item) => /pbs\.twimg\.com\/media|ton\.twitter\.com|twimg\.com/.test(item.url))
+      .filter((item) => !/\/(profile_images|profile_banners|emoji)\//i.test(item.url))
+      .filter((item) => /pbs\.twimg\.com\/media|ton\.twitter\.com/i.test(item.url) || Math.max(Number(item.width || 0), Number(item.height || 0)) >= 320)
       .filter((item, index, items) => items.findIndex((other) => other.url === item.url) === index);
 
     const title = document.querySelector("h1")?.innerText || document.title.replace(/\s*\/\s*X$/, "");

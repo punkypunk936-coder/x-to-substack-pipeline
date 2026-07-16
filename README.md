@@ -2,7 +2,7 @@
 
 Core workflow:
 
-`Watch @0xgoodie Articles -> deduplicate -> queue dashboard drafts -> edit/preview -> publish to Substack`
+`Watch @0xgoodie Articles -> deduplicate -> queue rich dashboard drafts -> edit/preview -> publish to Substack`
 
 ## Run
 
@@ -23,6 +23,16 @@ Paste a single X article/post URL and click `Create draft`.
 
 The server checks `https://x.com/0xgoodie/articles` and `https://manvinder.substack.com/feed` every 15 minutes. New X article status IDs are extracted once and added to `data/draft_pipeline.json`. Exact title matches in the public Substack feed are marked published and retain their canonical Substack URL. The dashboard performs an additional quiet sync when opened, keeps active drafts above published posts, and offers a manual `Sync all` control.
 
+The dashboard is the primary article editor. It supports:
+
+- Paragraph, heading, subheading, quote, bulleted list, numbered list, code, divider, image, and URL embed blocks.
+- Bold, italic, underline, strikethrough, and inline links.
+- Reordering and converting blocks without flattening the article back to plain text.
+- Image upload or remote image insertion, plus alt text, captions, and regular/wide/full layouts.
+- Local autosave, a faithful article preview, background Substack draft transfer, and direct publish.
+
+Existing plain-text drafts are upgraded into ordered blocks when opened. The same sanitized block document powers local preview, RSS output, Substack draft transfer, and direct publishing, so formatting is not maintained in separate copies.
+
 The installed macOS LaunchAgent `com.manvinder.x-substack-bridge` starts the local server at login and keeps it running. Publishing is never automatic: new items enter as drafts and require the dashboard's explicit `Publish now` confirmation.
 
 The tool tries, in order:
@@ -40,8 +50,9 @@ Outputs:
 - `draft.html`: rendered Substack-style draft preview.
 - `feed.xml`: RSS import feed for Substack.
 - `substack-import.csv`: CSV handoff.
-- Rich HTML copied to clipboard when browser permissions allow it.
-- `Publish to Substack`: launches the configured Substack publisher connector.
+- Rich, block-ordered HTML for Substack transfer.
+- `Save to Substack`: saves the rich draft through the configured background Chrome connector.
+- `Publish now`: sends the same saved dashboard version through Substack's final publish flow.
 
 ## Exact Capture
 
@@ -72,7 +83,7 @@ Substack does not expose a stable official public draft-publish API. This tool p
 
 ## Publish Button Setup
 
-The local `Publish to Substack` button opens Substack's normal web editor in your already-running, logged-in Chrome profile.
+The local Substack actions use Substack's normal web editor in your already-running, logged-in Chrome profile, but keep the dashboard in front. Editing and preview remain in the dashboard; Chrome is only the authenticated background bridge.
 
 Set your Substack editor/dashboard URL before starting the server:
 

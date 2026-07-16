@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
+import { draftBodyHtml, draftPlainText, imageCount } from "./rich_draft.mjs";
 
 const payloadPath = process.argv[2];
 const editorUrl = process.env.SUBSTACK_EDITOR_URL || process.env.SUBSTACK_PUBLISH_URL || "";
@@ -11,39 +12,6 @@ const allowAutopublish = process.env.SUBSTACK_AUTOPUBLISH === "1";
 function finish(result, code = 0) {
   console.log(JSON.stringify(result));
   process.exit(code);
-}
-
-function htmlEscape(value) {
-  return String(value || "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
-}
-
-function draftPlainText(draft) {
-  return [
-    draft.title || "Untitled X article",
-    draft.subtitle || "",
-    draft.body || "",
-    ...(draft.media || []).map((item) => item.url || "").filter(Boolean),
-  ].filter(Boolean).join("\n\n");
-}
-
-function draftHtml(draft) {
-  const title = `<h1>${htmlEscape(draft.title || "Untitled X article")}</h1>`;
-  const subtitle = draft.subtitle ? `<p>${htmlEscape(draft.subtitle)}</p>` : "";
-  const body = String(draft.body || "")
-    .split(/\n{2,}/)
-    .filter(Boolean)
-    .map((paragraph) => paragraph.startsWith("## ")
-      ? `<h2>${htmlEscape(paragraph.slice(3))}</h2>`
-      : `<p>${htmlEscape(paragraph).replaceAll("\n", "<br>")}</p>`)
-    .join("");
-  const media = (draft.media || [])
-    .map((item) => item.url ? `<figure><img src="${htmlEscape(item.url)}" alt="${htmlEscape(item.alt || "X media")}"></figure>` : "")
-    .join("");
-  return `${title}${subtitle}${body}${media}`;
 }
 
 async function count(locator) {
@@ -143,7 +111,7 @@ try {
       "text/plain": new Blob([text], { type: "text/plain" }),
     });
     await navigator.clipboard.write([item]);
-  }, { html: draftHtml(draft), text: draftPlainText(draft) }).catch(async () => {
+  }, { html: draftBodyHtml(draft), text: draftPlainText(draft) }).catch(async () => {
     await page.context().grantPermissions(["clipboard-read", "clipboard-write"]).catch(() => {});
     await page.evaluate(async (text) => navigator.clipboard.writeText(text), draftPlainText(draft));
   });
@@ -164,13 +132,26 @@ try {
   }
   await bodyBox.click({ timeout: 5000 });
   await page.keyboard.press(process.platform === "darwin" ? "Meta+V" : "Control+V");
-  await page.waitForTimeout(2500);
+  await page.waitForTimeout(7000);
+
+  const expectedImages = imageCount(draft);
+  const transferredImages = await bodyBox.locator("img").count().catch(() => 0);
+  if (expectedImages > 0 && transferredImages < expectedImages) {
+    finish({
+      ok: false,
+      status: "media_transfer_incomplete",
+      message: "Substack did not accept every image, so publishing was stopped before anything went live.",
+      expected_images: expectedImages,
+      image_count: transferredImages,
+      current_url: page.url(),
+    }, 4);
+  }
 
   if (!(confirmPublish && allowAutopublish)) {
     finish({
       ok: true,
       status: "draft_populated",
-      message: "Substack draft/editor populated. Set SUBSTACK_AUTOPUBLISH=1 and click Publish to allow final publish automation.",
+      message: "Rich Substack draft saved in the background. Keep editing or publish from the dashboard.",
       current_url: page.url(),
       profile_dir: profileDir,
     });
@@ -192,4 +173,3 @@ try {
 } finally {
   await browser.close().catch(() => {});
 }
-

@@ -1,13 +1,42 @@
 const $ = (selector) => document.querySelector(selector);
 
+const TEXT_BLOCK_TYPES = new Set(["paragraph", "heading", "subheading", "quote", "code"]);
+const LIST_BLOCK_TYPES = new Set(["bullet_list", "numbered_list"]);
+const BLOCK_LABELS = {
+  paragraph: "Paragraph",
+  heading: "Heading",
+  subheading: "Subheading",
+  quote: "Quote",
+  bullet_list: "Bulleted list",
+  numbered_list: "Numbered list",
+  code: "Code",
+};
+
 let currentDraft = null;
-let editorDirty = false;
 let currentPipeline = null;
+let editorBlocks = [];
+let editorDirty = false;
+let autosaveTimer = null;
+let activeBlockId = null;
+let mediaSourceMode = "upload";
+let mediaEditingId = null;
+let draggedBlockId = null;
 
 function setStatus(message, mode = "idle") {
   const node = $("#statusLine");
   node.textContent = message;
   node.dataset.mode = mode;
+}
+
+function setSaveState(message, mode = "saved") {
+  const node = $("#saveState");
+  node.textContent = message;
+  node.className = `save-state ${mode === "saved" ? "" : mode}`.trim();
+}
+
+function uid() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID().replaceAll("-", "").slice(0, 12);
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function escapeHtml(value) {
@@ -18,34 +47,143 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
+function sanitizeInline(value) {
+  const template = document.createElement("template");
+  template.innerHTML = String(value || "");
+  const allowed = new Set(["A", "B", "BR", "CODE", "EM", "I", "MARK", "S", "STRIKE", "STRONG", "SUB", "SUP", "U"]);
+  const nodes = [...template.content.querySelectorAll("*")];
+  for (const node of nodes) {
+    if (!allowed.has(node.tagName)) {
+      node.replaceWith(...node.childNodes);
+      continue;
+    }
+    const rawHref = node.tagName === "A" ? node.getAttribute("href") || "" : "";
+    for (const attribute of [...node.attributes]) node.removeAttribute(attribute.name);
+    if (node.tagName === "A") {
+      let safeHref = "";
+      try {
+        const parsed = new URL(rawHref, window.location.href);
+        if (["http:", "https:", "mailto:"].includes(parsed.protocol)) safeHref = parsed.href;
+      } catch {}
+      if (safeHref) {
+        node.setAttribute("href", safeHref);
+        node.setAttribute("target", "_blank");
+        node.setAttribute("rel", "noopener noreferrer");
+      } else {
+        node.replaceWith(...node.childNodes);
+      }
+    }
+  }
+  return template.innerHTML.trim();
+}
+
+function plainText(value) {
+  const container = document.createElement("div");
+  container.innerHTML = String(value || "");
+  container.querySelectorAll("br").forEach((lineBreak) => lineBreak.replaceWith(" "));
+  return (container.textContent || "").trim();
+}
+
+function normalizeBlock(raw = {}) {
+  const type = raw.type || "paragraph";
+  const block = { id: raw.id || uid(), type };
+  if (TEXT_BLOCK_TYPES.has(type)) block.html = sanitizeInline(raw.html ?? raw.text ?? "");
+  if (LIST_BLOCK_TYPES.has(type)) {
+    const items = Array.isArray(raw.items) ? raw.items : [raw.html || raw.text || ""];
+    block.items = items.map(sanitizeInline);
+    if (!block.items.length) block.items = [""];
+  }
+  if (type === "image") {
+    Object.assign(block, {
+      url: String(raw.url || ""),
+      alt: String(raw.alt || ""),
+      caption: String(raw.caption || ""),
+      layout: ["regular", "wide", "full"].includes(raw.layout) ? raw.layout : "regular",
+    });
+  }
+  if (type === "embed") Object.assign(block, { url: String(raw.url || ""), caption: String(raw.caption || "") });
+  return block;
+}
+
+function draftBlocks(draft) {
+  if (Array.isArray(draft.blocks) && draft.blocks.length) return draft.blocks.map(normalizeBlock);
+  const blocks = String(draft.body || "")
+    .split(/\n{2,}/)
+    .filter((part) => part.trim())
+    .map((part) => {
+      const text = part.trim();
+      if (text.startsWith("## ")) return normalizeBlock({ type: "heading", html: escapeHtml(text.slice(3)) });
+      return normalizeBlock({ type: "paragraph", html: escapeHtml(text).replaceAll("\n", "<br>") });
+    });
+  for (const media of draft.media || []) {
+    if (media?.url) blocks.push(normalizeBlock({ type: media.type === "image" ? "image" : "embed", ...media }));
+  }
+  return blocks.length ? blocks : [normalizeBlock()];
+}
+
+function blockWords(block) {
+  if (TEXT_BLOCK_TYPES.has(block.type)) return plainText(block.html);
+  if (LIST_BLOCK_TYPES.has(block.type)) return (block.items || []).map(plainText).join(" ");
+  return [block.alt, block.caption].filter(Boolean).join(" ");
+}
+
+function wordCount(blocks = editorBlocks) {
+  return blocks
+    .map(blockWords)
+    .join(" ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+}
+
+function mediaCount(blocks = editorBlocks) {
+  return blocks.filter((block) => block.type === "image" || block.type === "embed").length;
+}
+
+function blocksHtml(blocks) {
+  return blocks.map((block) => {
+    if (block.type === "paragraph") return `<p>${sanitizeInline(block.html) || "<br>"}</p>`;
+    if (block.type === "heading") return `<h2>${sanitizeInline(block.html)}</h2>`;
+    if (block.type === "subheading") return `<h3>${sanitizeInline(block.html)}</h3>`;
+    if (block.type === "quote") return `<blockquote><p>${sanitizeInline(block.html)}</p></blockquote>`;
+    if (block.type === "code") return `<pre><code>${escapeHtml(plainText(block.html))}</code></pre>`;
+    if (LIST_BLOCK_TYPES.has(block.type)) {
+      const tag = block.type === "bullet_list" ? "ul" : "ol";
+      return `<${tag}>${(block.items || []).map((item) => `<li>${sanitizeInline(item)}</li>`).join("")}</${tag}>`;
+    }
+    if (block.type === "divider") return "<hr>";
+    if (block.type === "image") {
+      const caption = block.caption ? `<figcaption>${escapeHtml(block.caption)}</figcaption>` : "";
+      return `<figure data-layout="${escapeHtml(block.layout || "regular")}"><img src="${escapeHtml(block.url)}" alt="${escapeHtml(block.alt)}">${caption}</figure>`;
+    }
+    if (block.type === "embed") {
+      return `<p class="embed"><a href="${escapeHtml(block.url)}" target="_blank" rel="noopener">${escapeHtml(block.caption || block.url)}</a></p>`;
+    }
+    return "";
+  }).join("");
+}
+
 function draftHtml(draft) {
   const title = escapeHtml(draft.title || "Untitled X article");
   const subtitle = draft.subtitle ? `<p>${escapeHtml(draft.subtitle)}</p>` : "";
-  const body = String(draft.body || "")
-    .split(/\n{2,}/)
-    .filter(Boolean)
-    .map((paragraph) => paragraph.startsWith("## ")
-      ? `<h2>${escapeHtml(paragraph.slice(3))}</h2>`
-      : `<p>${escapeHtml(paragraph).replaceAll("\n", "<br>")}</p>`)
-    .join("");
-  const media = (draft.media || [])
-    .map((item) => item.url ? `<figure><img src="${escapeHtml(item.url)}" alt="${escapeHtml(item.alt || "X media")}"></figure>` : "")
-    .join("");
-  return `<h1>${title}</h1>${subtitle}${body}${media}`;
+  return `<h1>${title}</h1>${subtitle}${blocksHtml(draftBlocks(draft))}`;
 }
 
 function renderDraft(draft) {
   currentDraft = draft;
+  editorBlocks = draftBlocks(draft);
   $("#workspace").classList.remove("hidden");
   $("#draftTitle").textContent = draft.title || "Untitled X article";
   $("#draftSubtitle").textContent = draft.subtitle || "";
-  $("#draftMeta").textContent = `${draft.source || "source"} / ${(draft.body || "").split(/\s+/).filter(Boolean).length} words / ${(draft.media || []).length} media item(s)`;
+  $("#draftMeta").textContent = `${draft.source || "source"} / ${wordCount(editorBlocks)} words / ${mediaCount(editorBlocks)} media item(s)`;
   $("#editTitle").value = draft.title || "";
   $("#editSubtitle").value = draft.subtitle || "";
-  $("#editBody").value = draft.body || "";
   editorDirty = false;
+  activeBlockId = editorBlocks[0]?.id || null;
+  renderBlocks();
   updateEditMeta();
   renderInlinePreview();
+  setSaveState("Saved locally");
   const warnings = draft.warnings || [];
   $("#warningLine").textContent = warnings.length ? warnings.join(" ") : "";
   $("#publishLine").textContent = "";
@@ -90,14 +228,380 @@ function renderPipeline(pipeline) {
   $("#syncLine").textContent = sync.status === "syncing" ? "Checking X and Substack..." : formatSyncTime(sync.last_sync);
 }
 
+function makeToolButton(label, title, handler) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "tool-button";
+  button.textContent = label;
+  button.title = title;
+  button.setAttribute("aria-label", title);
+  button.addEventListener("click", handler);
+  return button;
+}
+
+function blockTypeSelect(block) {
+  const select = document.createElement("select");
+  select.className = "block-type-control";
+  select.setAttribute("aria-label", "Change block type");
+  for (const [value, label] of Object.entries(BLOCK_LABELS)) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    option.selected = value === block.type;
+    select.appendChild(option);
+  }
+  select.addEventListener("change", () => changeBlockType(block.id, select.value));
+  return select;
+}
+
+function blockControls(block, index) {
+  const controls = document.createElement("div");
+  controls.className = "block-controls";
+  if (TEXT_BLOCK_TYPES.has(block.type) || LIST_BLOCK_TYPES.has(block.type)) controls.appendChild(blockTypeSelect(block));
+  if (block.type === "image") {
+    const editButton = makeToolButton("Edit", "Edit image", () => openMediaDialog(block.id));
+    editButton.classList.add("media-edit-button");
+    controls.appendChild(editButton);
+  }
+  controls.appendChild(makeToolButton("↑", "Move block up", () => moveBlock(block.id, -1)));
+  controls.appendChild(makeToolButton("↓", "Move block down", () => moveBlock(block.id, 1)));
+  controls.appendChild(makeToolButton("×", "Delete block", () => deleteBlock(block.id)));
+  controls.querySelectorAll("button").forEach((button) => {
+    if (button.title === "Move block up") button.disabled = index === 0;
+    if (button.title === "Move block down") button.disabled = index === editorBlocks.length - 1;
+  });
+  return controls;
+}
+
+function textContentNode(block) {
+  const content = document.createElement("div");
+  content.className = "block-content";
+  content.contentEditable = "true";
+  content.spellcheck = block.type !== "code";
+  content.dataset.placeholder = BLOCK_LABELS[block.type] || "Write something";
+  content.innerHTML = sanitizeInline(block.html);
+  content.addEventListener("input", () => {
+    block.html = sanitizeInline(content.innerHTML);
+    markDirty();
+  });
+  content.addEventListener("focus", () => { activeBlockId = block.id; });
+  content.addEventListener("keydown", (event) => handleTextKeydown(event, block, content));
+  return content;
+}
+
+function listContentNode(block) {
+  const list = document.createElement(block.type === "bullet_list" ? "ul" : "ol");
+  list.className = "block-list";
+  const syncItems = () => {
+    block.items = [...list.querySelectorAll(".list-item")].map((item) => sanitizeInline(item.innerHTML));
+  };
+  const makeItem = (value = "") => {
+    const item = document.createElement("li");
+    item.className = "list-item";
+    item.contentEditable = "true";
+    item.spellcheck = true;
+    item.dataset.placeholder = "List item";
+    item.innerHTML = sanitizeInline(value);
+    item.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        const selection = window.getSelection();
+        let before = sanitizeInline(item.innerHTML);
+        let after = "";
+        if (selection?.rangeCount && item.contains(selection.anchorNode)) {
+          const range = selection.getRangeAt(0);
+          const beforeRange = document.createRange();
+          beforeRange.selectNodeContents(item);
+          beforeRange.setEnd(range.startContainer, range.startOffset);
+          const afterRange = document.createRange();
+          afterRange.selectNodeContents(item);
+          afterRange.setStart(range.endContainer, range.endOffset);
+          const beforeBox = document.createElement("div");
+          const afterBox = document.createElement("div");
+          beforeBox.appendChild(beforeRange.cloneContents());
+          afterBox.appendChild(afterRange.cloneContents());
+          before = sanitizeInline(beforeBox.innerHTML);
+          after = sanitizeInline(afterBox.innerHTML);
+        }
+        item.innerHTML = before;
+        const next = makeItem(after);
+        item.after(next);
+        syncItems();
+        markDirty();
+        next.focus();
+      } else if (event.key === "Backspace" && !plainText(item.innerHTML) && list.children.length > 1) {
+        event.preventDefault();
+        const previous = item.previousElementSibling || item.nextElementSibling;
+        item.remove();
+        syncItems();
+        markDirty();
+        previous?.focus();
+      }
+    });
+    return item;
+  };
+  for (const value of block.items || [""]) list.appendChild(makeItem(value));
+  list.addEventListener("input", () => {
+    syncItems();
+    markDirty();
+  });
+  list.addEventListener("focusin", () => { activeBlockId = block.id; });
+  return list;
+}
+
+function imageContentNode(block) {
+  const figure = document.createElement("figure");
+  figure.className = "image-block-editor";
+  figure.dataset.layout = block.layout || "regular";
+  const image = document.createElement("img");
+  image.src = block.url;
+  image.alt = block.alt || "";
+  const caption = document.createElement("input");
+  caption.className = "image-caption";
+  caption.placeholder = "Add caption";
+  caption.value = block.caption || "";
+  caption.addEventListener("input", () => {
+    block.caption = caption.value;
+    markDirty();
+  });
+  caption.addEventListener("focus", () => { activeBlockId = block.id; });
+  figure.append(image, caption);
+  return figure;
+}
+
+function embedContentNode(block) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "embed-block-editor";
+  const link = document.createElement("a");
+  link.href = block.url;
+  link.target = "_blank";
+  link.rel = "noopener";
+  link.textContent = block.url;
+  const caption = document.createElement("input");
+  caption.className = "embed-caption";
+  caption.placeholder = "Add caption";
+  caption.value = block.caption || "";
+  caption.addEventListener("input", () => {
+    block.caption = caption.value;
+    markDirty();
+  });
+  wrapper.append(link, caption);
+  return wrapper;
+}
+
+function renderBlocks({ focusId = null } = {}) {
+  const editor = $("#blockEditor");
+  editor.replaceChildren();
+  editorBlocks.forEach((block, index) => {
+    const row = document.createElement("section");
+    row.className = "editor-block";
+    row.dataset.blockId = block.id;
+    row.dataset.type = block.type;
+
+    const grip = makeToolButton("⋮⋮", "Drag to reorder", () => {});
+    grip.classList.add("block-grip");
+    grip.draggable = true;
+    grip.addEventListener("dragstart", (event) => {
+      draggedBlockId = block.id;
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", block.id);
+    });
+    grip.addEventListener("dragend", () => { draggedBlockId = null; });
+
+    let content;
+    if (TEXT_BLOCK_TYPES.has(block.type)) content = textContentNode(block);
+    else if (LIST_BLOCK_TYPES.has(block.type)) content = listContentNode(block);
+    else if (block.type === "image") content = imageContentNode(block);
+    else if (block.type === "embed") content = embedContentNode(block);
+    else {
+      content = document.createElement("hr");
+      content.className = "block-divider";
+    }
+    row.append(grip, content, blockControls(block, index));
+    editor.appendChild(row);
+  });
+  if (focusId) focusBlock(focusId);
+}
+
+function focusBlock(id, atEnd = false) {
+  window.requestAnimationFrame(() => {
+    const row = document.querySelector(`[data-block-id="${CSS.escape(id)}"]`);
+    const target = row?.querySelector("[contenteditable='true'], input");
+    if (!target) return;
+    target.focus();
+    if (atEnd && target.isContentEditable) {
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(target);
+      range.collapse(false);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+  });
+}
+
+function handleTextKeydown(event, block, content) {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    const selection = window.getSelection();
+    let before = sanitizeInline(content.innerHTML);
+    let after = "";
+    if (selection?.rangeCount && content.contains(selection.anchorNode)) {
+      const range = selection.getRangeAt(0);
+      const beforeRange = document.createRange();
+      beforeRange.selectNodeContents(content);
+      beforeRange.setEnd(range.startContainer, range.startOffset);
+      const afterRange = document.createRange();
+      afterRange.selectNodeContents(content);
+      afterRange.setStart(range.endContainer, range.endOffset);
+      const beforeBox = document.createElement("div");
+      const afterBox = document.createElement("div");
+      beforeBox.appendChild(beforeRange.cloneContents());
+      afterBox.appendChild(afterRange.cloneContents());
+      before = sanitizeInline(beforeBox.innerHTML);
+      after = sanitizeInline(afterBox.innerHTML);
+    }
+    block.html = before;
+    const next = normalizeBlock({ type: "paragraph", html: after });
+    insertBlock(next, block.id);
+    return;
+  }
+  if (event.key === "Backspace" && !plainText(content.innerHTML) && editorBlocks.length > 1) {
+    event.preventDefault();
+    const index = editorBlocks.findIndex((item) => item.id === block.id);
+    const previous = editorBlocks[index - 1];
+    editorBlocks.splice(index, 1);
+    markDirty({ render: false });
+    renderBlocks({ focusId: previous?.id || editorBlocks[0].id });
+  }
+}
+
+function insertBlock(block, afterId = activeBlockId) {
+  const index = editorBlocks.findIndex((item) => item.id === afterId);
+  editorBlocks.splice(index >= 0 ? index + 1 : editorBlocks.length, 0, normalizeBlock(block));
+  activeBlockId = block.id;
+  markDirty({ render: false });
+  renderBlocks({ focusId: block.id });
+}
+
+function moveBlock(id, direction) {
+  const index = editorBlocks.findIndex((block) => block.id === id);
+  const nextIndex = index + direction;
+  if (index < 0 || nextIndex < 0 || nextIndex >= editorBlocks.length) return;
+  const [block] = editorBlocks.splice(index, 1);
+  editorBlocks.splice(nextIndex, 0, block);
+  activeBlockId = id;
+  markDirty({ render: false });
+  renderBlocks({ focusId: id });
+}
+
+function deleteBlock(id) {
+  const index = editorBlocks.findIndex((block) => block.id === id);
+  if (index < 0) return;
+  editorBlocks.splice(index, 1);
+  if (!editorBlocks.length) editorBlocks.push(normalizeBlock());
+  activeBlockId = editorBlocks[Math.max(0, index - 1)]?.id || editorBlocks[0].id;
+  markDirty({ render: false });
+  renderBlocks({ focusId: activeBlockId });
+}
+
+function changeBlockType(id, nextType) {
+  const block = editorBlocks.find((item) => item.id === id);
+  if (!block || block.type === nextType) return;
+  const text = TEXT_BLOCK_TYPES.has(block.type) ? plainText(block.html) : (block.items || []).map(plainText).join("\n");
+  block.type = nextType;
+  if (TEXT_BLOCK_TYPES.has(nextType)) {
+    block.html = escapeHtml(text).replaceAll("\n", "<br>");
+    delete block.items;
+  } else {
+    block.items = text.split(/\n+/).filter(Boolean).map(escapeHtml);
+    if (!block.items.length) block.items = [""];
+    delete block.html;
+  }
+  markDirty({ render: false });
+  renderBlocks({ focusId: id });
+}
+
+function markDirty({ render = true } = {}) {
+  editorDirty = true;
+  setSaveState("Unsaved changes", "saving");
+  if (render) {
+    updateEditMeta();
+    renderInlinePreview();
+  } else {
+    updateEditMeta();
+  }
+  window.clearTimeout(autosaveTimer);
+  autosaveTimer = window.setTimeout(() => saveDraft({ quiet: true, autosave: true }).catch(() => {}), 1200);
+}
+
+function updateEditMeta() {
+  $("#editMeta").textContent = `${wordCount()} words · ${editorBlocks.length} blocks · ${mediaCount()} media`;
+}
+
+function renderInlinePreview() {
+  $("#previewTitle").textContent = $("#editTitle").value || "Untitled";
+  const subtitle = $("#editSubtitle").value.trim();
+  $("#previewSubtitle").textContent = subtitle;
+  $("#previewSubtitle").classList.toggle("hidden", !subtitle);
+  $("#previewBody").innerHTML = blocksHtml(editorBlocks);
+}
+
+function setDraftView(mode) {
+  const previewing = mode === "preview";
+  $("#editor").classList.toggle("hidden", previewing);
+  $("#inlinePreview").classList.toggle("hidden", !previewing);
+  $("#editTab").classList.toggle("active", !previewing);
+  $("#previewTab").classList.toggle("active", previewing);
+  $("#editTab").setAttribute("aria-selected", String(!previewing));
+  $("#previewTab").setAttribute("aria-selected", String(previewing));
+  if (previewing) renderInlinePreview();
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: { "content-type": "application/json", ...(options.headers || {}) },
+  });
+  const data = await response.json();
+  if (!response.ok || data.error) throw new Error(data.error || `Request failed: ${response.status}`);
+  return data;
+}
+
+async function saveDraft({ quiet = false, autosave = false } = {}) {
+  if (!currentDraft) throw new Error("Create a draft first.");
+  window.clearTimeout(autosaveTimer);
+  setSaveState(autosave ? "Autosaving..." : "Saving...", "saving");
+  const data = await api("/api/draft", {
+    method: "POST",
+    body: JSON.stringify({
+      title: $("#editTitle").value,
+      subtitle: $("#editSubtitle").value,
+      blocks: editorBlocks,
+    }),
+  });
+  currentDraft = data.draft;
+  editorBlocks = draftBlocks(data.draft);
+  editorDirty = false;
+  renderPipeline(data.pipeline);
+  $("#draftTitle").textContent = data.draft.title;
+  $("#draftSubtitle").textContent = data.draft.subtitle || "";
+  $("#draftMeta").textContent = `${data.draft.source || "source"} / ${wordCount()} words / ${mediaCount()} media item(s)`;
+  setSaveState(autosave ? "Autosaved" : "Saved locally");
+  if (!quiet) setStatus("Draft changes saved.", "ok");
+  return data.draft;
+}
+
+async function prepareSavedDraft() {
+  window.clearTimeout(autosaveTimer);
+  if (editorDirty) await saveDraft({ quiet: true });
+}
+
 async function selectDraft(id) {
   if (editorDirty && !window.confirm("Discard unsaved changes and open another draft?")) return;
   setStatus("Opening draft...", "busy");
   try {
-    const data = await api("/api/drafts/select", {
-      method: "POST",
-      body: JSON.stringify({ id }),
-    });
+    const data = await api("/api/drafts/select", { method: "POST", body: JSON.stringify({ id }) });
     renderPipeline(data.pipeline);
     renderDraft(data.draft);
     setDraftView("edit");
@@ -125,16 +629,6 @@ async function syncDrafts({ silent = false } = {}) {
   }
 }
 
-async function api(path, options = {}) {
-  const response = await fetch(path, {
-    ...options,
-    headers: { "content-type": "application/json", ...(options.headers || {}) },
-  });
-  const data = await response.json();
-  if (!response.ok || data.error) throw new Error(data.error || `Request failed: ${response.status}`);
-  return data;
-}
-
 async function ingest() {
   const url = $("#xUrl").value.trim();
   if (!url) {
@@ -142,71 +636,17 @@ async function ingest() {
     return;
   }
   $("#ingestButton").disabled = true;
-  setStatus("Opening X in your logged-in Chrome session and building the Substack draft...", "busy");
+  setStatus("Capturing the X article and building its rich draft...", "busy");
   try {
-    const data = await api("/api/ingest", {
-      method: "POST",
-      body: JSON.stringify({ url }),
-    });
+    const data = await api("/api/ingest", { method: "POST", body: JSON.stringify({ url }) });
     renderPipeline(data.pipeline);
     renderDraft(data.draft);
-    setStatus("Draft package ready. Rich HTML copied if your browser allowed clipboard access.", "ok");
-    await copyRichDraft(false);
+    setStatus("Draft ready to edit or publish.", "ok");
   } catch (error) {
     setStatus(error.message, "error");
   } finally {
     $("#ingestButton").disabled = false;
   }
-}
-
-function updateEditMeta() {
-  const words = ($("#editBody").value || "").trim().split(/\s+/).filter(Boolean).length;
-  $("#editMeta").textContent = `${words} words`;
-}
-
-function renderInlinePreview() {
-  $("#previewTitle").textContent = $("#editTitle").value || "Untitled";
-  const subtitle = $("#editSubtitle").value.trim();
-  $("#previewSubtitle").textContent = subtitle;
-  $("#previewSubtitle").classList.toggle("hidden", !subtitle);
-  const body = $("#previewBody");
-  body.replaceChildren();
-  for (const block of $("#editBody").value.split(/\n{2,}/).filter((part) => part.trim())) {
-    const node = document.createElement(block.startsWith("## ") ? "h2" : "p");
-    node.textContent = block.startsWith("## ") ? block.slice(3).trim() : block.trim();
-    body.appendChild(node);
-  }
-}
-
-function setDraftView(mode) {
-  const previewing = mode === "preview";
-  $("#editor").classList.toggle("hidden", previewing);
-  $("#inlinePreview").classList.toggle("hidden", !previewing);
-  $("#editTab").classList.toggle("active", !previewing);
-  $("#previewTab").classList.toggle("active", previewing);
-  $("#editTab").setAttribute("aria-selected", String(!previewing));
-  $("#previewTab").setAttribute("aria-selected", String(previewing));
-  if (previewing) renderInlinePreview();
-}
-
-async function saveDraft({ quiet = false } = {}) {
-  if (!currentDraft) throw new Error("Create a draft first.");
-  const data = await api("/api/draft", {
-    method: "POST",
-    body: JSON.stringify({
-      title: $("#editTitle").value,
-      subtitle: $("#editSubtitle").value,
-      body: $("#editBody").value,
-    }),
-  });
-  renderPipeline(data.pipeline);
-  renderDraft(data.draft);
-  if (!quiet) setStatus("Draft changes saved.", "ok");
-  return data.draft;
-}
-
-async function prepareSavedDraft() {
-  if (editorDirty) await saveDraft({ quiet: true });
 }
 
 async function sendToSubstack(mode) {
@@ -219,24 +659,18 @@ async function sendToSubstack(mode) {
   try {
     await prepareSavedDraft();
     if (mode === "publish") {
-      const confirmed = window.confirm(
-        `Publish “${currentDraft.title}” to Everyone now? Substack will also send it by email and in the Substack app.`
-      );
+      const confirmed = window.confirm(`Publish “${currentDraft.title}” to Everyone now? Substack will also send it by email and in the Substack app.`);
       if (!confirmed) return;
     }
-    $("#publishLine").textContent = mode === "publish" ? "Publishing to Substack..." : "Preparing Substack editor...";
-    setStatus(mode === "publish" ? "Sending the saved draft to Substack..." : "Opening the saved draft in Substack...", "busy");
+    $("#publishLine").textContent = mode === "publish" ? "Publishing to Substack..." : "Saving a Substack draft in the background...";
+    setStatus(mode === "publish" ? "Publishing the saved rich draft..." : "Sending the saved rich draft to Substack...", "busy");
     const result = await api("/api/publish", {
       method: "POST",
       body: JSON.stringify({ mode, confirm_publish: mode === "publish" }),
     });
     if (result.pipeline) renderPipeline(result.pipeline);
-    $("#publishLine").textContent = result.message || result.status || "Publish step finished.";
-    if (result.ok) {
-      setStatus(result.message || "Substack step finished.", result.status === "published" ? "ok" : "busy");
-    } else {
-      setStatus(result.message || "Publish setup required.", "error");
-    }
+    $("#publishLine").textContent = result.message || result.status || "Substack step finished.";
+    setStatus(result.message || "Substack step finished.", result.ok ? "ok" : "error");
   } catch (error) {
     $("#publishLine").textContent = error.message;
     setStatus(error.message, "error");
@@ -245,21 +679,125 @@ async function sendToSubstack(mode) {
   }
 }
 
+function setMediaSourceMode(mode) {
+  mediaSourceMode = mode;
+  const uploading = mode === "upload";
+  $("#uploadMediaTab").classList.toggle("active", uploading);
+  $("#urlMediaTab").classList.toggle("active", !uploading);
+  $("#uploadMediaTab").setAttribute("aria-selected", String(uploading));
+  $("#urlMediaTab").setAttribute("aria-selected", String(!uploading));
+  $("#uploadMediaPanel").classList.toggle("hidden", !uploading);
+  $("#urlMediaPanel").classList.toggle("hidden", uploading);
+}
+
+function openMediaDialog(blockId = null) {
+  mediaEditingId = blockId;
+  const block = editorBlocks.find((item) => item.id === blockId);
+  $("#mediaForm").reset();
+  $("#mediaFileName").textContent = "PNG, JPEG, WebP, or GIF";
+  $("#mediaAlt").value = block?.alt || "";
+  $("#mediaCaption").value = block?.caption || "";
+  $("#mediaLayout").value = block?.layout || "regular";
+  $("#mediaUrl").value = block?.url?.startsWith("http") ? block.url : "";
+  setMediaSourceMode(block?.url?.startsWith("http") ? "url" : "upload");
+  $("#mediaDialog").showModal();
+}
+
+function closeMediaDialog() {
+  mediaEditingId = null;
+  $("#mediaDialog").close();
+}
+
+function fileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error("That image could not be read."));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function submitMedia(event) {
+  event.preventDefault();
+  const button = $("#insertMedia");
+  button.disabled = true;
+  try {
+    const existing = editorBlocks.find((block) => block.id === mediaEditingId);
+    let url = existing?.url || "";
+    if (mediaSourceMode === "upload") {
+      const file = $("#mediaFile").files[0];
+      if (file) {
+        const data = await api("/api/media", {
+          method: "POST",
+          body: JSON.stringify({ name: file.name, type: file.type, data: await fileAsDataUrl(file) }),
+        });
+        url = data.media.url;
+      } else if (!url) {
+        throw new Error("Choose an image first.");
+      }
+    } else {
+      url = $("#mediaUrl").value.trim();
+      if (!/^https?:\/\//i.test(url)) throw new Error("Enter a complete image URL.");
+    }
+    const imageBlock = normalizeBlock({
+      id: existing?.id || uid(),
+      type: "image",
+      url,
+      alt: $("#mediaAlt").value.trim(),
+      caption: $("#mediaCaption").value.trim(),
+      layout: $("#mediaLayout").value,
+    });
+    if (existing) Object.assign(existing, imageBlock);
+    else insertBlock(imageBlock);
+    markDirty({ render: false });
+    renderBlocks({ focusId: imageBlock.id });
+    renderInlinePreview();
+    closeMediaDialog();
+  } catch (error) {
+    setStatus(error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function addEmbed() {
+  const url = window.prompt("Paste the media or embed URL:", "https://");
+  if (!url) return;
+  if (!/^https?:\/\//i.test(url)) {
+    setStatus("Enter a complete media URL.", "error");
+    return;
+  }
+  const caption = window.prompt("Caption (optional):", "") || "";
+  const block = normalizeBlock({ id: uid(), type: "embed", url, caption });
+  insertBlock(block);
+}
+
+function applyInlineCommand(command) {
+  const selection = window.getSelection();
+  const anchor = selection?.anchorNode;
+  const anchorElement = anchor?.nodeType === Node.ELEMENT_NODE ? anchor : anchor?.parentElement;
+  const editable = anchorElement?.closest?.("[contenteditable='true']");
+  if (!editable || !$("#blockEditor").contains(editable)) return;
+  if (command === "createLink") {
+    const url = window.prompt("Link URL:", "https://");
+    if (!url) return;
+    document.execCommand(command, false, url);
+  } else {
+    document.execCommand(command, false);
+  }
+  editable.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "formatBold" }));
+}
+
 async function copyRichDraft(showStatus = true) {
   if (!currentDraft) return;
-  const html = draftHtml(currentDraft);
-  const text = `# ${currentDraft.title || "Untitled X article"}\n\n${currentDraft.subtitle ? `${currentDraft.subtitle}\n\n` : ""}${currentDraft.body || ""}`;
+  const richDraft = { ...currentDraft, title: $("#editTitle").value, subtitle: $("#editSubtitle").value, blocks: editorBlocks };
+  const richHtml = draftHtml(richDraft);
+  const text = `${richDraft.title}\n\n${richDraft.subtitle ? `${richDraft.subtitle}\n\n` : ""}${editorBlocks.map(blockWords).join("\n\n")}`;
   try {
-    if (window.ClipboardItem) {
-      await navigator.clipboard.write([
-        new ClipboardItem({
-          "text/html": new Blob([html], { type: "text/html" }),
-          "text/plain": new Blob([text], { type: "text/plain" }),
-        }),
-      ]);
-    } else {
-      await navigator.clipboard.writeText(text);
-    }
+    await navigator.clipboard.write([new ClipboardItem({
+      "text/html": new Blob([richHtml], { type: "text/html" }),
+      "text/plain": new Blob([text], { type: "text/plain" }),
+    })]);
     if (showStatus) setStatus("Rich draft copied.", "ok");
   } catch {
     await navigator.clipboard.writeText(text);
@@ -274,32 +812,70 @@ async function loadCurrent() {
   window.setTimeout(() => syncDrafts({ silent: true }), 800);
 }
 
-$("#ingestButton").addEventListener("click", ingest);
-$("#xUrl").addEventListener("keydown", (event) => {
-  if (event.key === "Enter") ingest();
+$("#blockEditor").addEventListener("dragover", (event) => {
+  if (!draggedBlockId) return;
+  event.preventDefault();
 });
+$("#blockEditor").addEventListener("drop", (event) => {
+  if (!draggedBlockId) return;
+  event.preventDefault();
+  const target = event.target.closest(".editor-block");
+  if (!target || target.dataset.blockId === draggedBlockId) return;
+  const from = editorBlocks.findIndex((block) => block.id === draggedBlockId);
+  const to = editorBlocks.findIndex((block) => block.id === target.dataset.blockId);
+  if (from < 0 || to < 0) return;
+  const [block] = editorBlocks.splice(from, 1);
+  editorBlocks.splice(to, 0, block);
+  markDirty({ render: false });
+  renderBlocks({ focusId: draggedBlockId });
+});
+
+$("#ingestButton").addEventListener("click", ingest);
+$("#xUrl").addEventListener("keydown", (event) => { if (event.key === "Enter") ingest(); });
 $("#editTab").addEventListener("click", () => setDraftView("edit"));
 $("#previewTab").addEventListener("click", () => setDraftView("preview"));
-$("#cancelEdit").addEventListener("click", () => {
-  if (currentDraft) renderDraft(currentDraft);
-});
-$("#editor").addEventListener("input", () => {
-  editorDirty = true;
-  updateEditMeta();
-  renderInlinePreview();
-});
+$("#cancelEdit").addEventListener("click", () => { if (currentDraft) renderDraft(currentDraft); });
+$("#editTitle").addEventListener("input", () => markDirty());
+$("#editSubtitle").addEventListener("input", () => markDirty());
 $("#editor").addEventListener("submit", async (event) => {
   event.preventDefault();
   $("#saveDraft").disabled = true;
   try {
     await saveDraft();
   } catch (error) {
+    setSaveState("Save failed", "error");
     setStatus(error.message, "error");
   } finally {
     $("#saveDraft").disabled = false;
   }
 });
+$("#addBlockButton").addEventListener("click", () => insertBlock(normalizeBlock({ id: uid(), type: $("#blockTypeSelect").value })));
+$("#dividerButton").addEventListener("click", () => insertBlock({ id: uid(), type: "divider" }));
+$("#imageButton").addEventListener("click", () => openMediaDialog());
+$("#embedButton").addEventListener("click", addEmbed);
+$("#linkButton").addEventListener("mousedown", (event) => { event.preventDefault(); applyInlineCommand("createLink"); });
+document.querySelectorAll(".format-button").forEach((button) => {
+  button.addEventListener("mousedown", (event) => {
+    event.preventDefault();
+    applyInlineCommand(button.dataset.command);
+  });
+});
+$("#mediaForm").addEventListener("submit", submitMedia);
+$("#mediaFile").addEventListener("change", () => {
+  const file = $("#mediaFile").files[0];
+  $("#mediaFileName").textContent = file ? file.name : "PNG, JPEG, WebP, or GIF";
+  if (file && !$("#mediaAlt").value) $("#mediaAlt").value = file.name.replace(/\.[^.]+$/, "").replaceAll(/[-_]/g, " ");
+});
+$("#uploadMediaTab").addEventListener("click", () => setMediaSourceMode("upload"));
+$("#urlMediaTab").addEventListener("click", () => setMediaSourceMode("url"));
+$("#closeMediaDialog").addEventListener("click", closeMediaDialog);
+$("#cancelMedia").addEventListener("click", closeMediaDialog);
 $("#substackDraftButton").addEventListener("click", () => sendToSubstack("review"));
 $("#publishButton").addEventListener("click", () => sendToSubstack("publish"));
 $("#syncButton").addEventListener("click", () => syncDrafts());
-loadCurrent().catch(() => {});
+window.addEventListener("beforeunload", (event) => {
+  if (!editorDirty) return;
+  event.preventDefault();
+});
+
+loadCurrent().catch((error) => setStatus(error.message, "error"));

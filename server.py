@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import datetime as dt
 import email.utils
@@ -19,6 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -39,9 +41,22 @@ PUBLISH_RESULT_JSON = DATA_DIR / "publish_result.json"
 X_EXTRACT_RESULT_JSON = DATA_DIR / "x_extract_result.json"
 DRAFT_PIPELINE_JSON = DATA_DIR / "draft_pipeline.json"
 SYNC_STATE_JSON = DATA_DIR / "sync_state.json"
+MEDIA_DIR = DATA_DIR / "media"
 ENV_FILE = ROOT / ".env"
 DRAFT_LOCK = threading.RLock()
 SYNC_LOCK = threading.Lock()
+
+TEXT_BLOCK_TYPES = {"paragraph", "heading", "subheading", "quote", "code"}
+LIST_BLOCK_TYPES = {"bullet_list", "numbered_list"}
+MEDIA_BLOCK_TYPES = {"image", "embed"}
+BLOCK_TYPES = TEXT_BLOCK_TYPES | LIST_BLOCK_TYPES | MEDIA_BLOCK_TYPES | {"divider"}
+IMAGE_MIME_EXTENSIONS = {
+    "image/gif": ".gif",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
+MAX_MEDIA_BYTES = 12 * 1024 * 1024
 
 
 UA = (
@@ -124,6 +139,373 @@ class TextParser(HTMLParser):
         return " ".join(self.parts).strip()
 
 
+class InlineHTMLSanitizer(HTMLParser):
+    allowed_tags = {"a", "b", "br", "code", "em", "i", "mark", "s", "strike", "strong", "sub", "sup", "u"}
+    void_tags = {"br"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.parts: List[str] = []
+        self.open_tags: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        tag = tag.lower()
+        if tag not in self.allowed_tags:
+            return
+        rendered_attrs = ""
+        if tag == "a":
+            values = {key.lower(): value or "" for key, value in attrs}
+            href = safe_web_url(values.get("href", ""), allow_mailto=True)
+            if href:
+                rendered_attrs = f' href="{html.escape(href, quote=True)}" target="_blank" rel="noopener noreferrer"'
+        self.parts.append(f"<{tag}{rendered_attrs}>")
+        if tag not in self.void_tags:
+            self.open_tags.append(tag)
+
+    def handle_startendtag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag not in self.allowed_tags or tag in self.void_tags or tag not in self.open_tags:
+            return
+        while self.open_tags:
+            opened = self.open_tags.pop()
+            self.parts.append(f"</{opened}>")
+            if opened == tag:
+                break
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(html.escape(data, quote=False))
+
+    def handle_entityref(self, name: str) -> None:
+        self.parts.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        self.parts.append(f"&#{name};")
+
+    @property
+    def value(self) -> str:
+        while self.open_tags:
+            self.parts.append(f"</{self.open_tags.pop()}>")
+        return "".join(self.parts).strip()
+
+
+def safe_web_url(value: Any, *, allow_mailto: bool = False, allow_local_media: bool = False) -> str:
+    url = str(value or "").strip()
+    if not url:
+        return ""
+    if allow_local_media and re.fullmatch(r"/media/[A-Za-z0-9._-]+", url):
+        return url
+    parsed = urllib.parse.urlparse(url)
+    allowed_schemes = {"http", "https"} | ({"mailto"} if allow_mailto else set())
+    return url if parsed.scheme.lower() in allowed_schemes else ""
+
+
+def sanitize_inline_html(value: Any) -> str:
+    parser = InlineHTMLSanitizer()
+    parser.feed(str(value or ""))
+    parser.close()
+    return parser.value
+
+
+def strip_inline_html(value: Any) -> str:
+    parser = TextParser()
+    parser.feed(str(value or ""))
+    return html.unescape(parser.text)
+
+
+def block_id(value: Any = None) -> str:
+    candidate = re.sub(r"[^A-Za-z0-9_-]", "", str(value or ""))[:64]
+    return candidate or uuid.uuid4().hex[:12]
+
+
+def normalize_block(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    block_type = str(raw.get("type") or "paragraph")
+    if block_type not in BLOCK_TYPES:
+        block_type = "paragraph"
+    block: Dict[str, Any] = {"id": block_id(raw.get("id")), "type": block_type}
+    if block_type in TEXT_BLOCK_TYPES:
+        content = sanitize_inline_html(raw.get("html") if raw.get("html") is not None else raw.get("text"))
+        if block_type != "code" and not strip_inline_html(content).strip() and "<br" not in content:
+            content = ""
+        block["html"] = content
+    elif block_type in LIST_BLOCK_TYPES:
+        items = raw.get("items") if isinstance(raw.get("items"), list) else []
+        block["items"] = [sanitize_inline_html(item) for item in items if strip_inline_html(item).strip()]
+        if not block["items"]:
+            block["items"] = [""]
+    elif block_type == "image":
+        image_url = safe_web_url(raw.get("url"), allow_local_media=True)
+        if re.search(r"/(profile_images|profile_banners|emoji)/", image_url, re.I):
+            return None
+        block.update(
+            {
+                "url": image_url,
+                "alt": clean_text(str(raw.get("alt") or ""))[:500],
+                "caption": clean_text(str(raw.get("caption") or ""))[:500],
+                "layout": str(raw.get("layout") or "regular") if str(raw.get("layout") or "regular") in {"regular", "wide", "full"} else "regular",
+            }
+        )
+        if not block["url"]:
+            return None
+    elif block_type == "embed":
+        url = safe_web_url(raw.get("url"))
+        if not url:
+            return None
+        block.update({"url": url, "caption": clean_text(str(raw.get("caption") or ""))[:500]})
+    return block
+
+
+def legacy_blocks(draft: Dict[str, Any]) -> List[Dict[str, Any]]:
+    blocks: List[Dict[str, Any]] = []
+    body = clean_text(str(draft.get("body") or ""))
+    parts = [part.strip() for part in re.split(r"\n{2,}", body) if part.strip()]
+    if "\n\n" not in body and len(body.splitlines()) >= 8:
+        parts = []
+        lines = [line.strip() for line in body.splitlines() if line.strip()]
+
+        def looks_like_heading(index: int) -> bool:
+            line = lines[index]
+            if len(line) > 72 or word_count(line) > 11 or re.search(r"[.!?,:;]$", line):
+                return False
+            if index == len(lines) - 1:
+                return False
+            following = lines[index + 1]
+            return len(following) >= 70 or word_count(following) >= 12 or (
+                len(following) >= len(line) + 20 and bool(re.search(r"[.!?]$", following))
+            )
+
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            if looks_like_heading(index):
+                parts.append(f"## {line}")
+                index += 1
+                continue
+            parts.append(line)
+            if line.endswith(":"):
+                list_items: List[str] = []
+                cursor = index + 1
+                while cursor < len(lines):
+                    candidate = lines[cursor]
+                    if (list_items and candidate.endswith(":")) or len(candidate) > 58 or word_count(candidate) > 8:
+                        break
+                    list_items.append(candidate)
+                    cursor += 1
+                if len(list_items) >= 2:
+                    parts.extend([f"- {item}" for item in list_items])
+                    index = cursor
+                    continue
+            index += 1
+
+        grouped: List[str] = []
+        index = 0
+        while index < len(parts):
+            if parts[index].startswith("- "):
+                items: List[str] = []
+                while index < len(parts) and parts[index].startswith("- "):
+                    items.append(parts[index][2:])
+                    index += 1
+                grouped.append("\n".join(f"- {item}" for item in items))
+                continue
+            grouped.append(parts[index])
+            index += 1
+        parts = grouped
+
+    for part in parts:
+        text = part.strip()
+        if not text:
+            continue
+        block_type = "paragraph"
+        if text.startswith("### "):
+            block_type, text = "subheading", text[4:]
+        elif text.startswith("## "):
+            block_type, text = "heading", text[3:]
+        elif text.startswith("> "):
+            block_type, text = "quote", text[2:]
+        elif text.startswith("- "):
+            blocks.append(
+                {
+                    "id": block_id(),
+                    "type": "bullet_list",
+                    "items": [html.escape(line[2:].strip()) for line in text.splitlines() if line.startswith("- ")],
+                }
+            )
+            continue
+        blocks.append({"id": block_id(), "type": block_type, "html": html.escape(text).replace("\n", "<br>")})
+    for media in list(draft.get("media") or []):
+        if not isinstance(media, dict):
+            continue
+        url = safe_web_url(media.get("url"), allow_local_media=True)
+        if not url:
+            continue
+        if str(media.get("type") or "image") == "image":
+            blocks.append(
+                {
+                    "id": block_id(),
+                    "type": "image",
+                    "url": url,
+                    "alt": clean_text(str(media.get("alt") or ""))[:500],
+                    "caption": "",
+                    "layout": "regular",
+                }
+            )
+        else:
+            blocks.append({"id": block_id(), "type": "embed", "url": url, "caption": "Media from X"})
+    return blocks or [{"id": block_id(), "type": "paragraph", "html": ""}]
+
+
+def normalize_blocks(draft: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_blocks = draft.get("blocks")
+    if not isinstance(raw_blocks, list):
+        return legacy_blocks(draft)
+    blocks = [block for raw in raw_blocks if (block := normalize_block(raw)) is not None]
+    return blocks or [{"id": block_id(), "type": "paragraph", "html": ""}]
+
+
+def block_plain_text(block: Dict[str, Any]) -> str:
+    block_type = str(block.get("type") or "paragraph")
+    if block_type in TEXT_BLOCK_TYPES:
+        return strip_inline_html(block.get("html"))
+    if block_type in LIST_BLOCK_TYPES:
+        return " ".join(strip_inline_html(item) for item in block.get("items") or [])
+    if block_type in MEDIA_BLOCK_TYPES:
+        return " ".join([str(block.get("alt") or ""), str(block.get("caption") or "")]).strip()
+    return ""
+
+
+def blocks_plain_text(blocks: List[Dict[str, Any]]) -> str:
+    return "\n\n".join(text for block in blocks if (text := block_plain_text(block).strip()))
+
+
+def blocks_to_markdown(blocks: List[Dict[str, Any]]) -> str:
+    chunks: List[str] = []
+    for block in blocks:
+        block_type = str(block.get("type") or "paragraph")
+        text = block_plain_text(block).strip()
+        if block_type == "heading":
+            chunks.append(f"## {text}")
+        elif block_type == "subheading":
+            chunks.append(f"### {text}")
+        elif block_type == "quote":
+            chunks.append("\n".join(f"> {line}" for line in text.splitlines()))
+        elif block_type == "code":
+            chunks.append(f"```\n{text}\n```")
+        elif block_type == "bullet_list":
+            chunks.append("\n".join(f"- {strip_inline_html(item)}" for item in block.get("items") or []))
+        elif block_type == "numbered_list":
+            chunks.append("\n".join(f"{index}. {strip_inline_html(item)}" for index, item in enumerate(block.get("items") or [], 1)))
+        elif block_type == "divider":
+            chunks.append("---")
+        elif block_type == "image":
+            chunks.append(f"![{block.get('alt') or ''}]({block.get('url') or ''})")
+            if block.get("caption"):
+                chunks.append(str(block["caption"]))
+        elif block_type == "embed":
+            chunks.append(str(block.get("url") or ""))
+        elif text:
+            chunks.append(text)
+    return "\n\n".join(chunks).strip()
+
+
+def blocks_to_html(blocks: List[Dict[str, Any]]) -> str:
+    chunks: List[str] = []
+    for block in blocks:
+        block_type = str(block.get("type") or "paragraph")
+        content = str(block.get("html") or "")
+        if block_type == "paragraph":
+            chunks.append(f"<p>{content or '<br>'}</p>")
+        elif block_type == "heading":
+            chunks.append(f"<h2>{content}</h2>")
+        elif block_type == "subheading":
+            chunks.append(f"<h3>{content}</h3>")
+        elif block_type == "quote":
+            chunks.append(f"<blockquote><p>{content}</p></blockquote>")
+        elif block_type == "code":
+            chunks.append(f"<pre><code>{html.escape(strip_inline_html(content))}</code></pre>")
+        elif block_type in LIST_BLOCK_TYPES:
+            tag = "ul" if block_type == "bullet_list" else "ol"
+            items = "".join(f"<li>{item}</li>" for item in block.get("items") or [])
+            chunks.append(f"<{tag}>{items}</{tag}>")
+        elif block_type == "divider":
+            chunks.append("<hr>")
+        elif block_type == "image":
+            url = html.escape(str(block.get("url") or ""), quote=True)
+            alt = html.escape(str(block.get("alt") or ""), quote=True)
+            caption = html.escape(str(block.get("caption") or ""))
+            layout = html.escape(str(block.get("layout") or "regular"), quote=True)
+            chunks.append(
+                f'<figure data-layout="{layout}"><img src="{url}" alt="{alt}">'
+                + (f"<figcaption>{caption}</figcaption>" if caption else "")
+                + "</figure>"
+            )
+        elif block_type == "embed":
+            url = html.escape(str(block.get("url") or ""), quote=True)
+            caption = html.escape(str(block.get("caption") or ""))
+            chunks.append(f'<p class="embed"><a href="{url}">{caption or url}</a></p>')
+    return "\n".join(chunks)
+
+
+def save_media_upload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    mime_type = str(payload.get("type") or "").lower().split(";", 1)[0]
+    extension = IMAGE_MIME_EXTENSIONS.get(mime_type)
+    if not extension:
+        raise ValueError("Upload a PNG, JPEG, WebP, or GIF image.")
+    encoded = str(payload.get("data") or "")
+    if encoded.startswith("data:"):
+        _, _, encoded = encoded.partition(",")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("That image could not be read.") from exc
+    if not raw:
+        raise ValueError("That image is empty.")
+    if len(raw) > MAX_MEDIA_BYTES:
+        raise ValueError("Images must be 12 MB or smaller.")
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"{uuid.uuid4().hex}{extension}"
+    path = MEDIA_DIR / filename
+    path.write_bytes(raw)
+    return {
+        "url": f"/media/{filename}",
+        "name": clean_text(str(payload.get("name") or filename))[:240],
+        "type": mime_type,
+        "size": len(raw),
+    }
+
+
+def media_file_from_url(url: str) -> Optional[Path]:
+    match = re.fullmatch(r"/media/([A-Za-z0-9._-]+)", url)
+    if not match:
+        return None
+    candidate = (MEDIA_DIR / match.group(1)).resolve()
+    try:
+        candidate.relative_to(MEDIA_DIR.resolve())
+    except ValueError:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def publish_ready_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
+    ready = dict(draft)
+    blocks = normalize_blocks(draft)
+    publish_blocks: List[Dict[str, Any]] = []
+    for block in blocks:
+        item = dict(block)
+        if item.get("type") == "image":
+            path = media_file_from_url(str(item.get("url") or ""))
+            if path:
+                mime_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+                item["url"] = f"data:{mime_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+        publish_blocks.append(item)
+    ready["blocks"] = publish_blocks
+    ready["body"] = blocks_plain_text(publish_blocks)
+    return ready
+
+
 def json_bytes(payload: Any, status: int = 200) -> Tuple[int, bytes, str]:
     return status, json.dumps(payload, indent=2).encode("utf-8"), "application/json"
 
@@ -193,6 +575,12 @@ def word_count(text: str) -> int:
     return len(re.findall(r"\b[\w'-]+\b", text or ""))
 
 
+def draft_word_count(draft: Dict[str, Any]) -> int:
+    if isinstance(draft.get("blocks"), list):
+        return word_count(blocks_plain_text(normalize_blocks(draft)))
+    return word_count(str(draft.get("body") or ""))
+
+
 def is_byline_only(text: str) -> bool:
     cleaned = clean_text(text)
     return bool(
@@ -217,14 +605,16 @@ def is_login_wall(text: str) -> bool:
 
 def is_draft_usable(draft: Dict[str, Any]) -> bool:
     body = clean_text(str(draft.get("body") or ""))
-    media = list(draft.get("media") or [])
+    blocks = normalize_blocks(draft) if isinstance(draft.get("blocks"), list) else []
+    media = list(draft.get("media") or []) or [block for block in blocks if block.get("type") in MEDIA_BLOCK_TYPES]
     if is_login_wall(body):
         return False
     if is_byline_only(body):
         return False
-    if word_count(body) >= 35:
+    words = word_count(blocks_plain_text(blocks)) if blocks else word_count(body)
+    if words >= 35:
         return True
-    return bool(media) and word_count(body) >= 12
+    return bool(media) and words >= 12
 
 
 def low_value_reason(source: str) -> str:
@@ -482,7 +872,7 @@ def media_html(media: List[Dict[str, str]]) -> str:
 
 
 def render_article_html(draft: Dict[str, Any]) -> str:
-    body_html = bridge.markdown_to_html(str(draft.get("body") or ""))
+    body_html = blocks_to_html(normalize_blocks(draft))
     title = html.escape(str(draft.get("title") or "Untitled X article"))
     subtitle = html.escape(str(draft.get("subtitle") or ""))
     source = html.escape(str(draft.get("url") or ""), quote=True)
@@ -501,7 +891,6 @@ def render_article_html(draft: Dict[str, Any]) -> str:
       <h1>{title}</h1>
       {f'<p class="subtitle">{subtitle}</p>' if subtitle else ''}
       <div class="body">{body_html}</div>
-      <div class="media">{media_html(list(draft.get("media") or []))}</div>
     </article>
   </main>
 </body>
@@ -527,7 +916,7 @@ def render_feed(draft: Dict[str, Any], base_url: str) -> str:
     ET.SubElement(item, "pubDate").text = email.utils.format_datetime(date, usegmt=True)
     ET.SubElement(item, "description").text = str(draft.get("subtitle") or "")
     content = ET.SubElement(item, "{http://purl.org/rss/1.0/modules/content/}encoded")
-    content.text = bridge.markdown_to_html(str(draft.get("body") or "")) + media_html(list(draft.get("media") or []))
+    content.text = blocks_to_html(normalize_blocks(draft))
     return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(rss, encoding="unicode")
 
 
@@ -543,7 +932,15 @@ a { color: var(--accent); }
 .source, .subtitle { color: var(--muted); }
 h1 { margin: 0 0 14px; font-size: clamp(2.2rem, 8vw, 4.7rem); line-height: .94; letter-spacing: 0; }
 .subtitle { margin: 0 0 28px; font-size: 1.1rem; }
-.body { font-size: 1.06rem; }
+.body { font: 1.08rem/1.72 Georgia, "Times New Roman", serif; }
+.body h2 { margin: 38px 0 12px; font-size: 1.7rem; line-height: 1.2; }
+.body h3 { margin: 30px 0 10px; font-size: 1.28rem; line-height: 1.25; }
+.body blockquote { margin: 28px 0; border-left: 3px solid var(--ink); padding-left: 20px; font-size: 1.18rem; font-style: italic; }
+.body pre { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; background: #f4f5f2; padding: 16px; font: .92rem/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.body hr { margin: 34px auto; width: 88px; border: 0; border-top: 1px solid var(--line); }
+.body figure[data-layout="wide"] { margin-left: max(-8vw, -80px); margin-right: max(-8vw, -80px); }
+.body figure[data-layout="full"] { margin-left: calc((min(100vw, 1180px) - 100%) / -2); margin-right: calc((min(100vw, 1180px) - 100%) / -2); }
+.body .embed { border-left: 3px solid var(--accent); background: #f2f5f3; padding: 14px 16px; }
 figure { margin: 28px 0 0; }
 img { max-width: 100%; border-radius: 8px; border: 1px solid var(--line); display: block; }
 figcaption { color: var(--muted); font-size: .9rem; margin-top: 7px; }
@@ -555,6 +952,9 @@ figcaption { color: var(--muted); font-size: .9rem; margin-top: 7px; }
 
 
 def persist_draft(draft: Dict[str, Any], base_url: str) -> Dict[str, Any]:
+    draft = dict(draft)
+    draft["blocks"] = normalize_blocks(draft)
+    draft["body"] = blocks_plain_text(draft["blocks"])
     if not is_draft_usable(draft):
         raise ValueError("Refusing to save an empty/byline-only draft. Capture the full X article first.")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -566,7 +966,7 @@ def persist_draft(draft: Dict[str, Any], base_url: str) -> Dict[str, Any]:
     date = str(draft.get("date") or dt.date.today().isoformat())
     md_path = CONTENT_DIR / f"{date}-{slug}.md"
     tags = "x, substack"
-    markdown = str(draft.get("body") or "").strip()
+    markdown = blocks_to_markdown(draft["blocks"])
     md_path.write_text(
         "\n".join(
             [
@@ -613,6 +1013,8 @@ def current_draft() -> Optional[Dict[str, Any]]:
     if not CURRENT_JSON.exists():
         return None
     draft = json.loads(CURRENT_JSON.read_text(encoding="utf-8"))
+    draft["blocks"] = normalize_blocks(draft)
+    draft["body"] = blocks_plain_text(draft["blocks"])
     return draft if is_draft_usable(draft) else None
 
 
@@ -685,6 +1087,8 @@ def upsert_pipeline_draft(
     with DRAFT_LOCK:
         pipeline = ensure_pipeline()
         draft = dict(draft)
+        draft["blocks"] = normalize_blocks(draft)
+        draft["body"] = blocks_plain_text(draft["blocks"])
         draft_id = pipeline_draft_id(draft)
         existing = next((item for item in pipeline["items"] if str(item.get("id")) == draft_id), None)
         timestamp = now_iso()
@@ -732,6 +1136,29 @@ def mark_selected_published() -> None:
                 item["status"] = "published"
                 item["published_at"] = timestamp
                 item["updated_at"] = timestamp
+                break
+        write_pipeline(pipeline)
+
+
+def remember_substack_draft_url(url: Any) -> None:
+    draft_url = safe_web_url(url)
+    if not draft_url:
+        return
+    configured_host = urllib.parse.urlparse(str(publish_config().get("editor_url") or "")).netloc.lower()
+    if configured_host and urllib.parse.urlparse(draft_url).netloc.lower() != configured_host:
+        return
+    with DRAFT_LOCK:
+        draft = current_draft()
+        if not draft:
+            return
+        draft["substack_draft_url"] = draft_url
+        CURRENT_JSON.write_text(json.dumps(draft, indent=2), encoding="utf-8")
+        pipeline = ensure_pipeline()
+        selected_id = str(pipeline.get("selected_id") or "")
+        for item in pipeline["items"]:
+            if str(item.get("id") or "") == selected_id:
+                item["substack_draft_url"] = draft_url
+                item["updated_at"] = now_iso()
                 break
         write_pipeline(pipeline)
 
@@ -835,8 +1262,8 @@ def pipeline_payload() -> Dict[str, Any]:
                 "url": item.get("url") or "",
                 "date": item.get("date") or "",
                 "status": item.get("status") or "draft",
-                "word_count": word_count(str(item.get("body") or "")),
-                "media_count": len(list(item.get("media") or [])),
+                "word_count": draft_word_count(item),
+                "media_count": len([block for block in normalize_blocks(item) if block.get("type") in MEDIA_BLOCK_TYPES]),
                 "discovered_at": item.get("discovered_at"),
                 "updated_at": item.get("updated_at"),
                 "published_at": item.get("published_at"),
@@ -953,8 +1380,9 @@ def publish_to_substack(confirm_publish: bool, allow_publish: bool = False) -> D
             "config": config,
         }
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    PUBLISH_PAYLOAD_JSON.write_text(json.dumps(draft, indent=2), encoding="utf-8")
+    PUBLISH_PAYLOAD_JSON.write_text(json.dumps(publish_ready_draft(draft), indent=2), encoding="utf-8")
     env = os.environ.copy()
+    env["SUBSTACK_EDITOR_URL"] = str(draft.get("substack_draft_url") or config["editor_url"])
     env["SUBSTACK_CONFIRM_PUBLISH"] = "1" if confirm_publish else "0"
     env["SUBSTACK_AUTOPUBLISH"] = "1" if allow_publish else "0"
     script = ROOT / (
@@ -1055,6 +1483,12 @@ class Handler(BaseHTTPRequestHandler):
             self.serve_file(DIST_DIR / "substack-import.csv", "text/csv; charset=utf-8")
         elif path == "/style.css":
             self.serve_file(DIST_DIR / "style.css", "text/css; charset=utf-8")
+        elif path.startswith("/media/"):
+            media_path = media_file_from_url(path)
+            if media_path:
+                self.serve_file(media_path)
+            else:
+                self.send_json({"error": "Media not found"}, 404)
         else:
             self.send_json({"error": "Not found"}, 404)
 
@@ -1071,12 +1505,17 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/ingest":
                 draft = build_draft(str(payload.get("url") or ""))
                 self.send_json({"ok": True, "draft": upsert_pipeline_draft(draft, self.base_url, select=True), "pipeline": pipeline_payload()})
+            elif path == "/api/media":
+                self.send_json({"ok": True, "media": save_media_upload(payload)}, 201)
             elif path == "/api/draft":
                 draft = current_draft()
                 if not draft:
                     raise ValueError("Create a draft from an X article first.")
                 title = str(payload.get("title") or "").strip()
-                body = clean_text(str(payload.get("body") or ""))
+                if not isinstance(payload.get("blocks"), list):
+                    raise ValueError("Draft blocks are required.")
+                blocks = normalize_blocks({"blocks": payload["blocks"]})
+                body = blocks_plain_text(blocks)
                 if not title:
                     raise ValueError("Draft title cannot be empty.")
                 if word_count(body) < 12:
@@ -1086,6 +1525,7 @@ class Handler(BaseHTTPRequestHandler):
                         "title": title[:240],
                         "subtitle": str(payload.get("subtitle") or "").strip()[:500],
                         "body": body,
+                        "blocks": blocks,
                     }
                 )
                 self.send_json({"ok": True, "draft": upsert_pipeline_draft(draft, self.base_url, select=True), "pipeline": pipeline_payload()})
@@ -1108,6 +1548,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 if result.get("ok") and result.get("status") == "published":
                     mark_selected_published()
+                elif result.get("ok") and result.get("current_url"):
+                    remember_substack_draft_url(result["current_url"])
                 result["pipeline"] = pipeline_payload()
                 self.send_json(result)
             else:
