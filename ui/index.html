@@ -32,7 +32,16 @@
           </div>
           <button id="syncButton" type="button" class="sync-button" title="Check X and Substack">Sync all</button>
         </div>
+        <p class="inbox-section-label">Ready drafts</p>
         <div id="draftList" class="draft-list"></div>
+        <p id="emptyDrafts" class="empty-drafts hidden">No drafts waiting.</p>
+        <details id="publishedHistory" class="published-history">
+          <summary>
+            <span>Published history</span>
+            <span id="publishedCount">0</span>
+          </summary>
+          <div id="publishedList" class="draft-list published-list"></div>
+        </details>
         <p id="syncLine" class="sync-line">Waiting for first sync.</p>
       </aside>
 

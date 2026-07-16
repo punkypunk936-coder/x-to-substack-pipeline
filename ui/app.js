@@ -199,9 +199,14 @@ function formatSyncTime(value) {
 function renderPipeline(pipeline) {
   currentPipeline = pipeline;
   $("#accountLabel").textContent = pipeline.account || "@0xgoodie";
-  const list = $("#draftList");
-  list.replaceChildren();
-  for (const item of pipeline.items || []) {
+  const draftList = $("#draftList");
+  const publishedList = $("#publishedList");
+  draftList.replaceChildren();
+  publishedList.replaceChildren();
+  const activeItems = (pipeline.items || []).filter((item) => item.status !== "published");
+  const publishedItems = (pipeline.items || []).filter((item) => item.status === "published");
+
+  const renderItem = (item, list) => {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "draft-item";
@@ -220,9 +225,21 @@ function renderPipeline(pipeline) {
     meta.textContent = `${item.word_count || 0} words · ${item.media_count || 0} media`;
 
     button.append(status, title, meta);
-    button.addEventListener("click", () => selectDraft(item.id));
+    button.addEventListener("click", () => {
+      if (item.status === "published" && item.substack_url) {
+        window.open(item.substack_url, "_blank", "noopener");
+        return;
+      }
+      selectDraft(item.id);
+    });
     list.appendChild(button);
-  }
+  };
+
+  activeItems.forEach((item) => renderItem(item, draftList));
+  publishedItems.forEach((item) => renderItem(item, publishedList));
+  $("#emptyDrafts").classList.toggle("hidden", activeItems.length > 0);
+  $("#publishedHistory").classList.toggle("hidden", publishedItems.length === 0);
+  $("#publishedCount").textContent = String(publishedItems.length);
   $("#workspace").classList.toggle("hidden", !(pipeline.items || []).length);
   const sync = pipeline.sync || {};
   $("#syncLine").textContent = sync.status === "syncing" ? "Checking X and Substack..." : formatSyncTime(sync.last_sync);
@@ -601,14 +618,19 @@ async function selectDraft(id) {
   if (editorDirty && !window.confirm("Discard unsaved changes and open another draft?")) return;
   setStatus("Opening draft...", "busy");
   try {
-    const data = await api("/api/drafts/select", { method: "POST", body: JSON.stringify({ id }) });
-    renderPipeline(data.pipeline);
-    renderDraft(data.draft);
-    setDraftView("edit");
+    await openDraft(id);
     setStatus("Draft ready.", "ok");
   } catch (error) {
     setStatus(error.message, "error");
   }
+}
+
+async function openDraft(id) {
+  const data = await api("/api/drafts/select", { method: "POST", body: JSON.stringify({ id }) });
+  renderPipeline(data.pipeline);
+  renderDraft(data.draft);
+  setDraftView("edit");
+  return data.draft;
 }
 
 async function syncDrafts({ silent = false } = {}) {
@@ -619,8 +641,22 @@ async function syncDrafts({ silent = false } = {}) {
   try {
     const data = await api("/api/drafts/sync", { method: "POST", body: "{}" });
     renderPipeline(data.pipeline);
-    const added = (data.added || []).length;
-    if (!silent || added) setStatus(added ? `${added} new article draft${added === 1 ? "" : "s"} added.` : "Draft pipeline is up to date.", "ok");
+    const addedIds = data.added || [];
+    const newlyPublished = data.newly_published || [];
+    const targetId = addedIds[0] || data.pipeline.selected_id;
+    if (
+      !editorDirty
+      && targetId
+      && String(currentDraft?.id || "") !== String(targetId)
+    ) {
+      await openDraft(targetId);
+    }
+    const updates = [];
+    if (addedIds.length) updates.push(`${addedIds.length} new X article draft${addedIds.length === 1 ? "" : "s"} added`);
+    if (newlyPublished.length) updates.push(`${newlyPublished.length} Substack post${newlyPublished.length === 1 ? "" : "s"} marked published`);
+    if (!silent || updates.length) {
+      setStatus(updates.length ? `${updates.join(". ")}.` : "X and Substack are fully reconciled.", "ok");
+    }
   } catch (error) {
     $("#syncLine").textContent = "Sync needs attention.";
     if (!silent) setStatus(error.message, "error");
@@ -809,6 +845,12 @@ async function loadCurrent() {
   const [data, pipeline] = await Promise.all([api("/api/current"), api("/api/drafts")]);
   renderPipeline(pipeline);
   if (data.draft) renderDraft(data.draft);
+  if (
+    pipeline.selected_id
+    && String(data.draft?.id || "") !== String(pipeline.selected_id)
+  ) {
+    await openDraft(pipeline.selected_id);
+  }
   window.setTimeout(() => syncDrafts({ silent: true }), 800);
 }
 

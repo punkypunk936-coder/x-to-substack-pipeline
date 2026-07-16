@@ -21,7 +21,7 @@ http://127.0.0.1:8788/
 
 Paste a single X article/post URL and click `Create draft`.
 
-The server checks `https://x.com/0xgoodie/articles` and `https://manvinder.substack.com/feed` every 15 minutes. New X article status IDs are extracted once and added to `data/draft_pipeline.json`. Exact title matches in the public Substack feed are marked published and retain their canonical Substack URL. The dashboard performs an additional quiet sync when opened, keeps active drafts above published posts, and offers a manual `Sync all` control.
+The server checks `https://x.com/0xgoodie/articles` and `https://manvinder.substack.com/feed` every 15 minutes. X status IDs are ordered chronologically and compared against a stored high-water mark, so newly posted articles are captured without backfilling older history. Substack reconciliation uses exact titles first, then tightly guarded near-title matching with token, sequence, one-to-one, and publication-date checks. Published records move into a collapsed history section, while the newest active X draft opens immediately. The dashboard performs an additional quiet sync after opening and offers a manual `Sync all` control.
 
 The dashboard is the primary article editor. It supports:
 

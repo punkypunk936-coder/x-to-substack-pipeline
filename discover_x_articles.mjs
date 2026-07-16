@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const accountUrl = process.env.X_ACCOUNT_URL || "https://x.com/0xgoodie/articles";
 const browserApp = process.env.X_BROWSER_APP || "Google Chrome";
-const maxArticles = Math.max(1, Number(process.env.X_SYNC_MAX_ARTICLES || 8));
+const maxArticles = Math.max(1, Number(process.env.X_SYNC_MAX_ARTICLES || 30));
 
 function finish(result, code = 0) {
   console.log(JSON.stringify(result));
@@ -18,7 +18,7 @@ const collectorJs = String.raw`
 (() => {
   window.__xSubstackArticleInbox ||= {};
   const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
-  for (const link of document.querySelectorAll("a[href*='/article/']")) {
+  for (const link of document.querySelectorAll("a[href*='/article/'], a[href*='/i/article/']")) {
     const article = link.closest("article") || link.closest("[data-testid='cellInnerDiv']");
     if (!article) continue;
     const statusLinks = Array.from(article.querySelectorAll("a[href*='/status/']"));
@@ -66,7 +66,7 @@ on run argv
       if (loading of targetTab is false) then exit repeat
     end repeat
     delay 2
-    repeat with i from 1 to 7
+    repeat with i from 1 to 14
       execute targetTab javascript jsSource
       delay 0.8
     end repeat
@@ -87,7 +87,17 @@ try {
     timeout: 60000,
     maxBuffer: 1024 * 1024 * 3,
   });
-  const items = JSON.parse(stdout.trim() || "[]").slice(0, maxArticles);
+  const items = JSON.parse(stdout.trim() || "[]")
+    .sort((left, right) => {
+      try {
+        const leftId = BigInt(left.id || "0");
+        const rightId = BigInt(right.id || "0");
+        return leftId === rightId ? 0 : leftId > rightId ? -1 : 1;
+      } catch {
+        return String(right.id || "").localeCompare(String(left.id || ""));
+      }
+    })
+    .slice(0, maxArticles);
   finish({ ok: true, status: "discovered", account_url: accountUrl, items });
 } catch (error) {
   finish({

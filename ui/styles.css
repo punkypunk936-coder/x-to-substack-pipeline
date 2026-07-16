@@ -265,6 +265,64 @@ button:disabled {
   overflow-y: auto;
 }
 
+.inbox-section-label {
+  margin: 0;
+  border-bottom: 1px solid var(--line);
+  padding: 10px 15px 8px;
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.empty-drafts {
+  margin: 0;
+  border-bottom: 1px solid var(--line);
+  padding: 18px 15px;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.published-history {
+  border-bottom: 1px solid var(--line);
+}
+
+.published-history summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 15px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 0.76rem;
+  font-weight: 800;
+  list-style: none;
+}
+
+.published-history summary::-webkit-details-marker {
+  display: none;
+}
+
+.published-history summary::before {
+  content: "+";
+  color: var(--accent);
+  font-size: 1rem;
+}
+
+.published-history[open] summary::before {
+  content: "-";
+}
+
+.published-history summary span:first-child {
+  margin-right: auto;
+}
+
+.published-list {
+  max-height: 340px;
+  border-top: 1px solid var(--line);
+}
+
 .draft-item {
   display: grid;
   width: 100%;

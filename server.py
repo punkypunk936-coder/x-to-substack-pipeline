@@ -5,6 +5,7 @@ import argparse
 import base64
 import csv
 import datetime as dt
+import difflib
 import email.utils
 import html
 import json
@@ -1183,6 +1184,42 @@ def normalized_title(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", " ", title).strip()
 
 
+def title_match_score(left: Any, right: Any) -> float:
+    left_title = normalized_title(left)
+    right_title = normalized_title(right)
+    if not left_title or not right_title:
+        return 0.0
+    if left_title == right_title:
+        return 1.0
+    left_tokens = {token for token in left_title.split() if len(token) > 1}
+    right_tokens = {token for token in right_title.split() if len(token) > 1}
+    if not left_tokens or not right_tokens:
+        return 0.0
+    shared = left_tokens & right_tokens
+    if len(shared) < 4:
+        return 0.0
+    containment = len(shared) / min(len(left_tokens), len(right_tokens))
+    if containment < 0.75:
+        return 0.0
+    union = left_tokens | right_tokens
+    jaccard = len(shared) / len(union)
+    sequence = difflib.SequenceMatcher(None, left_title, right_title).ratio()
+    if sequence < 0.82:
+        return 0.0
+    return round((sequence * 0.55) + (containment * 0.25) + (jaccard * 0.20), 6)
+
+
+def publication_date_matches(item: Dict[str, Any], post: Dict[str, Any], max_days: int = 21) -> bool:
+    item_date = str(item.get("date") or item.get("discovered_at") or "")[:10]
+    post_date = str(post.get("published_at") or "")[:10]
+    try:
+        left = dt.date.fromisoformat(item_date)
+        right = dt.date.fromisoformat(post_date)
+    except ValueError:
+        return True
+    return abs((left - right).days) <= max_days
+
+
 def substack_feed_url() -> str:
     configured = os.environ.get("SUBSTACK_FEED_URL") or ""
     if configured:
@@ -1216,17 +1253,67 @@ def fetch_substack_publications() -> List[Dict[str, Any]]:
 
 def reconcile_substack_publications() -> Dict[str, Any]:
     publications = fetch_substack_publications()
-    by_title = {normalized_title(post["title"]): post for post in publications if normalized_title(post["title"])}
     matched: List[str] = []
+    updated: List[str] = []
+    match_details: List[Dict[str, Any]] = []
     changed = False
     with DRAFT_LOCK:
         pipeline = ensure_pipeline()
+        matches: Dict[str, Tuple[Dict[str, Any], float, str]] = {}
+        unmatched_posts = set(range(len(publications)))
+
         for item in pipeline["items"]:
-            post = by_title.get(normalized_title(item.get("title")))
-            if not post:
+            item_id = str(item.get("id") or "")
+            item_title = normalized_title(item.get("title"))
+            if not item_id or not item_title:
                 continue
+            exact_candidates = [
+                index
+                for index in unmatched_posts
+                if normalized_title(publications[index].get("title")) == item_title
+                and publication_date_matches(item, publications[index])
+            ]
+            exact_index = min(exact_candidates, default=None)
+            if exact_index is None:
+                continue
+            matches[item_id] = (publications[exact_index], 1.0, "exact_title")
+            unmatched_posts.remove(exact_index)
+
+        for item in pipeline["items"]:
+            item_id = str(item.get("id") or "")
+            if not item_id or item_id in matches:
+                continue
+            candidates: List[Tuple[float, int]] = []
+            for index in unmatched_posts:
+                post = publications[index]
+                if not publication_date_matches(item, post):
+                    continue
+                score = title_match_score(item.get("title"), post.get("title"))
+                if score >= 0.88:
+                    candidates.append((score, index))
+            if not candidates:
+                continue
+            score, post_index = max(candidates)
+            matches[item_id] = (publications[post_index], score, "fuzzy_title")
+            unmatched_posts.remove(post_index)
+
+        for item in pipeline["items"]:
             draft_id = str(item.get("id") or "")
+            match = matches.get(draft_id)
+            if not match:
+                continue
+            post, score, method = match
             matched.append(draft_id)
+            match_details.append(
+                {
+                    "id": draft_id,
+                    "draft_title": item.get("title"),
+                    "publication_title": post.get("title"),
+                    "method": method,
+                    "score": score,
+                    "url": post.get("url"),
+                }
+            )
             next_published_at = post.get("published_at") or item.get("published_at") or now_iso()
             if (
                 item.get("status") != "published"
@@ -1237,10 +1324,34 @@ def reconcile_substack_publications() -> Dict[str, Any]:
                 item["substack_url"] = post["url"]
                 item["published_at"] = next_published_at
                 item["updated_at"] = now_iso()
+                updated.append(draft_id)
+                changed = True
+        selected_id = str(pipeline.get("selected_id") or "")
+        selected = next((item for item in pipeline["items"] if str(item.get("id") or "") == selected_id), None)
+        if not selected or selected.get("status") == "published":
+            active = [item for item in pipeline["items"] if item.get("status") != "published"]
+            next_selected = max(
+                active,
+                key=lambda item: (
+                    int(str(item.get("id") or "0")) if str(item.get("id") or "").isdigit() else 0,
+                    str(item.get("discovered_at") or ""),
+                ),
+                default=None,
+            )
+            next_selected_id = next_selected.get("id") if next_selected else None
+            if pipeline.get("selected_id") != next_selected_id:
+                pipeline["selected_id"] = next_selected_id
                 changed = True
         if changed:
             write_pipeline(pipeline)
-    return {"feed_url": substack_feed_url(), "publication_count": len(publications), "matched": matched, "changed": changed}
+    return {
+        "feed_url": substack_feed_url(),
+        "publication_count": len(publications),
+        "matched": matched,
+        "updated": updated,
+        "match_details": match_details,
+        "changed": changed,
+    }
 
 
 def pipeline_payload() -> Dict[str, Any]:
@@ -1276,6 +1387,16 @@ def pipeline_payload() -> Dict[str, Any]:
     }
 
 
+def should_ingest_discovered_id(draft_id: str, existing_ids: set[str], allow_backfill: bool = False) -> bool:
+    if not draft_id or draft_id in existing_ids:
+        return False
+    numeric_existing_ids = [int(item_id) for item_id in existing_ids if item_id.isdigit()]
+    newest_existing_id = max(numeric_existing_ids, default=0)
+    if newest_existing_id and draft_id.isdigit() and int(draft_id) <= newest_existing_id and not allow_backfill:
+        return False
+    return True
+
+
 def sync_x_articles(base_url: str) -> Dict[str, Any]:
     if not SYNC_LOCK.acquire(blocking=False):
         return {"ok": True, "status": "already_syncing", "pipeline": pipeline_payload()}
@@ -1295,10 +1416,11 @@ def sync_x_articles(base_url: str) -> Dict[str, Any]:
         except Exception as exc:
             errors.append(f"X sync: {exc}")
         existing_ids = {str(item.get("id")) for item in ensure_pipeline()["items"]}
+        allow_backfill = os.environ.get("X_SYNC_BACKFILL") == "1"
         for found in discovered:
             draft_id = str(found.get("id") or "")
             url = str(found.get("url") or "")
-            if not draft_id or not url or draft_id in existing_ids:
+            if not url or not should_ingest_discovered_id(draft_id, existing_ids, allow_backfill):
                 continue
             try:
                 draft = build_draft(url)
@@ -1332,6 +1454,8 @@ def sync_x_articles(base_url: str) -> Dict[str, Any]:
             "status": state["status"],
             "added": added,
             "published_matches": reconciliation.get("matched", []),
+            "newly_published": reconciliation.get("updated", []),
+            "publication_match_details": reconciliation.get("match_details", []),
             "pipeline": pipeline_payload(),
         }
     except Exception as exc:

@@ -1,4 +1,5 @@
 import base64
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -80,6 +81,69 @@ class RichDraftTests(unittest.TestCase):
 
         self.assertEqual([block["type"] for block in blocks], ["paragraph", "image"])
         self.assertIn("/media/ABC123", blocks[1]["url"])
+
+    def test_near_identical_cross_platform_titles_match(self) -> None:
+        score = server.title_match_score(
+            "Everyone’s a Trader Now and Everything Is Tradable",
+            "Everyone’s a Trader and Everything Is Tradable",
+        )
+
+        self.assertGreaterEqual(score, 0.88)
+        self.assertEqual(server.title_match_score("Trading apps", "India's tech-nomy"), 0.0)
+
+    def test_reconciliation_retires_published_selection(self) -> None:
+        previous_pipeline_path = server.DRAFT_PIPELINE_JSON
+        previous_fetch = server.fetch_substack_publications
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                server.DRAFT_PIPELINE_JSON = Path(directory) / "pipeline.json"
+                server.DRAFT_PIPELINE_JSON.write_text(
+                    json.dumps(
+                        {
+                            "selected_id": "200",
+                            "items": [
+                                {
+                                    "id": "200",
+                                    "title": "Everyone’s a Trader Now and Everything Is Tradable",
+                                    "date": "2026-07-16",
+                                    "status": "draft",
+                                },
+                                {
+                                    "id": "201",
+                                    "title": "The next great trading app will help you trade less",
+                                    "date": "2026-07-16",
+                                    "status": "draft",
+                                },
+                            ],
+                        }
+                    )
+                )
+                server.fetch_substack_publications = lambda: [
+                    {
+                        "title": "Everyone’s a Trader and Everything Is Tradable",
+                        "url": "https://manvinder.substack.com/p/everyones-a-trader",
+                        "published_at": "2026-07-16T04:23:26+00:00",
+                    }
+                ]
+
+                result = server.reconcile_substack_publications()
+                pipeline = json.loads(server.DRAFT_PIPELINE_JSON.read_text())
+
+                self.assertEqual(result["updated"], ["200"])
+                self.assertEqual(pipeline["selected_id"], "201")
+                self.assertEqual(pipeline["items"][0]["status"], "published")
+                self.assertEqual(pipeline["items"][0]["substack_url"], "https://manvinder.substack.com/p/everyones-a-trader")
+        finally:
+            server.DRAFT_PIPELINE_JSON = previous_pipeline_path
+            server.fetch_substack_publications = previous_fetch
+
+    def test_x_high_water_mark_accepts_only_newer_articles(self) -> None:
+        existing = {"200", "195"}
+
+        self.assertTrue(server.should_ingest_discovered_id("201", existing))
+        self.assertFalse(server.should_ingest_discovered_id("199", existing))
+        self.assertFalse(server.should_ingest_discovered_id("200", existing))
+        self.assertTrue(server.should_ingest_discovered_id("199", existing, allow_backfill=True))
 
     def test_local_upload_is_embedded_only_in_publish_payload(self) -> None:
         previous_media_dir = server.MEDIA_DIR
