@@ -21,6 +21,10 @@ let activeBlockId = null;
 let mediaSourceMode = "upload";
 let mediaEditingId = null;
 let draggedBlockId = null;
+let pipelineRenderKey = "";
+let pipelineRefreshTimer = null;
+let pipelineRefreshInFlight = false;
+let syncInFlight = false;
 
 function setStatus(message, mode = "idle") {
   const node = $("#statusLine");
@@ -196,8 +200,32 @@ function formatSyncTime(value) {
   return `Last checked ${date.toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}`;
 }
 
-function renderPipeline(pipeline) {
+function pipelineKey(pipeline) {
+  return JSON.stringify({
+    selected_id: pipeline.selected_id || null,
+    account: pipeline.account || "",
+    items: (pipeline.items || []).map((item) => [
+      item.id,
+      item.title,
+      item.status,
+      item.word_count,
+      item.media_count,
+      item.updated_at,
+      item.substack_url,
+    ]),
+    sync: [
+      pipeline.sync?.status,
+      pipeline.sync?.last_sync,
+      pipeline.sync?.last_error,
+    ],
+  });
+}
+
+function renderPipeline(pipeline, { force = false } = {}) {
   currentPipeline = pipeline;
+  const nextKey = pipelineKey(pipeline);
+  if (!force && nextKey === pipelineRenderKey) return false;
+  pipelineRenderKey = nextKey;
   $("#accountLabel").textContent = pipeline.account || "@0xgoodie";
   const draftList = $("#draftList");
   const publishedList = $("#publishedList");
@@ -243,6 +271,7 @@ function renderPipeline(pipeline) {
   $("#workspace").classList.toggle("hidden", !(pipeline.items || []).length);
   const sync = pipeline.sync || {};
   $("#syncLine").textContent = sync.status === "syncing" ? "Checking X and Substack..." : formatSyncTime(sync.last_sync);
+  return true;
 }
 
 function makeToolButton(label, title, handler) {
@@ -634,6 +663,9 @@ async function openDraft(id) {
 }
 
 async function syncDrafts({ silent = false } = {}) {
+  if (syncInFlight) return;
+  syncInFlight = true;
+  window.clearTimeout(pipelineRefreshTimer);
   const button = $("#syncButton");
   button.disabled = true;
   if (!silent) setStatus("Checking @0xgoodie and Substack...", "busy");
@@ -662,6 +694,8 @@ async function syncDrafts({ silent = false } = {}) {
     if (!silent) setStatus(error.message, "error");
   } finally {
     button.disabled = false;
+    syncInFlight = false;
+    schedulePipelineRefresh();
   }
 }
 
@@ -842,30 +876,51 @@ async function copyRichDraft(showStatus = true) {
 }
 
 async function loadCurrent() {
-  const [data, pipeline] = await Promise.all([api("/api/current"), api("/api/drafts")]);
-  renderPipeline(pipeline);
+  const data = await api("/api/bootstrap");
+  const pipeline = data.pipeline;
+  renderPipeline(pipeline, { force: true });
   if (data.draft) renderDraft(data.draft);
-  if (
-    pipeline.selected_id
-    && String(data.draft?.id || "") !== String(pipeline.selected_id)
-  ) {
-    await openDraft(pipeline.selected_id);
-  }
-  window.setTimeout(() => syncDrafts({ silent: true }), 800);
+  $("#loadingWorkspace").classList.add("hidden");
+  $("#workspace").classList.add("workspace-ready");
+  setStatus("Dashboard ready.", "ok");
+  return pipeline;
 }
 
 async function refreshPipelineState() {
-  if (editorDirty) return;
+  if (editorDirty || pipelineRefreshInFlight || syncInFlight) return currentPipeline;
+  pipelineRefreshInFlight = true;
   try {
     const pipeline = await api("/api/drafts");
     renderPipeline(pipeline);
+    const currentItem = (pipeline.items || []).find(
+      (item) => String(item.id || "") === String(currentDraft?.id || ""),
+    );
     if (
       pipeline.selected_id
       && String(currentDraft?.id || "") !== String(pipeline.selected_id)
+      && (!currentDraft || currentItem?.status === "published")
     ) {
       await openDraft(pipeline.selected_id);
     }
-  } catch {}
+    return pipeline;
+  } catch {
+    return currentPipeline;
+  } finally {
+    pipelineRefreshInFlight = false;
+  }
+}
+
+function refreshDelay(pipeline = currentPipeline) {
+  if (document.hidden) return 60000;
+  return pipeline?.sync?.status === "syncing" ? 4000 : 20000;
+}
+
+function schedulePipelineRefresh(delay = refreshDelay()) {
+  window.clearTimeout(pipelineRefreshTimer);
+  pipelineRefreshTimer = window.setTimeout(async () => {
+    const pipeline = await refreshPipelineState();
+    schedulePipelineRefresh(refreshDelay(pipeline));
+  }, delay);
 }
 
 $("#blockEditor").addEventListener("dragover", (event) => {
@@ -929,11 +984,17 @@ $("#cancelMedia").addEventListener("click", closeMediaDialog);
 $("#substackDraftButton").addEventListener("click", () => sendToSubstack("review"));
 $("#publishButton").addEventListener("click", () => sendToSubstack("publish"));
 $("#syncButton").addEventListener("click", () => syncDrafts());
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) schedulePipelineRefresh(500);
+});
 window.addEventListener("beforeunload", (event) => {
   if (!editorDirty) return;
   event.preventDefault();
 });
 
 loadCurrent()
-  .then(() => window.setInterval(refreshPipelineState, 15000))
-  .catch((error) => setStatus(error.message, "error"));
+  .then(() => schedulePipelineRefresh())
+  .catch((error) => {
+    $("#loadingWorkspace").classList.add("hidden");
+    setStatus(error.message, "error");
+  });

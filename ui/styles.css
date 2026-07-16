@@ -221,6 +221,112 @@ button:disabled {
   overflow: hidden;
 }
 
+.workspace.workspace-ready:not(.hidden) {
+  animation: workspace-in 180ms ease-out both;
+}
+
+.loading-workspace {
+  min-height: 590px;
+  pointer-events: none;
+}
+
+.loading-inbox {
+  padding: 18px 15px;
+}
+
+.loading-result {
+  grid-template-rows: auto 1fr;
+}
+
+.skeleton-block {
+  border-radius: 5px;
+  background: #e2e6e1;
+  animation: skeleton-pulse 1.35s ease-in-out infinite;
+}
+
+.skeleton-account {
+  width: 62%;
+  height: 38px;
+  margin-bottom: 28px;
+}
+
+.skeleton-draft {
+  width: 100%;
+  height: 78px;
+  margin-bottom: 12px;
+}
+
+.skeleton-draft.short {
+  width: 82%;
+}
+
+.skeleton-sync {
+  width: 56%;
+  height: 12px;
+  margin-top: 26px;
+}
+
+.skeleton-heading-group {
+  min-width: 0;
+}
+
+.skeleton-kicker {
+  width: 92px;
+  height: 11px;
+  margin-bottom: 13px;
+}
+
+.skeleton-title {
+  width: min(420px, 85%);
+  height: 32px;
+  margin-bottom: 12px;
+}
+
+.skeleton-meta {
+  width: min(260px, 62%);
+  height: 13px;
+}
+
+.skeleton-actions {
+  display: flex;
+  gap: 9px;
+}
+
+.skeleton-button {
+  width: 132px;
+  height: 44px;
+}
+
+.skeleton-editor {
+  grid-column: 1 / -1;
+  width: min(820px, 100%);
+  height: 410px;
+  margin: 30px auto 0;
+}
+
+@keyframes skeleton-pulse {
+  0%,
+  100% {
+    opacity: 0.9;
+  }
+
+  50% {
+    opacity: 0.42;
+  }
+}
+
+@keyframes workspace-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 .draft-inbox {
   min-width: 0;
   border-right: 1px solid var(--line);
@@ -960,6 +1066,13 @@ button:disabled {
   display: none;
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-block,
+  .workspace.workspace-ready:not(.hidden) {
+    animation: none;
+  }
+}
+
 @media (max-width: 720px) {
   .shell {
     width: min(100% - 22px, 980px);
@@ -979,6 +1092,34 @@ button:disabled {
   .draft-inbox {
     border-right: 0;
     border-bottom: 1px solid var(--line);
+  }
+
+  .loading-workspace {
+    min-height: 720px;
+  }
+
+  .loading-inbox {
+    display: grid;
+    grid-template-columns: 180px 250px;
+    gap: 12px;
+    overflow: hidden;
+  }
+
+  .loading-inbox .skeleton-block {
+    width: 100%;
+    margin: 0;
+  }
+
+  .skeleton-sync {
+    display: none;
+  }
+
+  .skeleton-actions {
+    display: none;
+  }
+
+  .skeleton-editor {
+    height: 360px;
   }
 
   .draft-list {

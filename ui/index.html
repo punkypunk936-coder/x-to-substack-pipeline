@@ -20,7 +20,28 @@
         <input id="xUrl" placeholder="https://x.com/.../status/..." autocomplete="off" autofocus>
         <button id="ingestButton">Create draft</button>
       </div>
-      <p id="statusLine" class="status">Waiting for an X article link.</p>
+      <p id="statusLine" class="status" data-mode="busy">Loading drafts...</p>
+    </section>
+
+    <section id="loadingWorkspace" class="workspace loading-workspace" aria-label="Loading dashboard">
+      <aside class="draft-inbox loading-inbox" aria-hidden="true">
+        <div class="skeleton-block skeleton-account"></div>
+        <div class="skeleton-block skeleton-draft"></div>
+        <div class="skeleton-block skeleton-draft short"></div>
+        <div class="skeleton-block skeleton-sync"></div>
+      </aside>
+      <section class="result loading-result" aria-hidden="true">
+        <div class="skeleton-heading-group">
+          <div class="skeleton-block skeleton-kicker"></div>
+          <div class="skeleton-block skeleton-title"></div>
+          <div class="skeleton-block skeleton-meta"></div>
+        </div>
+        <div class="skeleton-actions">
+          <div class="skeleton-block skeleton-button"></div>
+          <div class="skeleton-block skeleton-button"></div>
+        </div>
+        <div class="skeleton-block skeleton-editor"></div>
+      </section>
     </section>
 
     <section id="workspace" class="workspace hidden">

@@ -220,6 +220,51 @@ class RichDraftTests(unittest.TestCase):
         self.assertFalse(server.should_ingest_discovered_id("200", existing))
         self.assertTrue(server.should_ingest_discovered_id("199", existing, allow_backfill=True))
 
+    def test_bootstrap_uses_the_pipeline_selection(self) -> None:
+        previous_pipeline_path = server.DRAFT_PIPELINE_JSON
+        previous_publish_result_path = server.PUBLISH_RESULT_JSON
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                server.DRAFT_PIPELINE_JSON = Path(directory) / "pipeline.json"
+                server.PUBLISH_RESULT_JSON = Path(directory) / "publish-result.json"
+                server.DRAFT_PIPELINE_JSON.write_text(
+                    json.dumps(
+                        {
+                            "selected_id": "newer",
+                            "items": [
+                                {
+                                    "id": "older",
+                                    "title": "Older draft",
+                                    "body": (
+                                        "This older article body contains enough detail to be considered a usable draft. "
+                                        "It explains the setup, the market context, the core thesis, the risks involved, "
+                                        "and the practical conclusion a reader should take away after reviewing it."
+                                    ),
+                                    "status": "draft",
+                                },
+                                {
+                                    "id": "newer",
+                                    "title": "Selected draft",
+                                    "body": (
+                                        "This selected article body contains enough detail to be considered a usable draft. "
+                                        "It explains the setup, the market context, the core thesis, the risks involved, "
+                                        "and the practical conclusion a reader should take away after reviewing it."
+                                    ),
+                                    "status": "draft",
+                                },
+                            ],
+                        }
+                    )
+                )
+
+                payload = server.bootstrap_payload()
+
+                self.assertEqual(payload["draft"]["id"], "newer")
+                self.assertEqual(payload["pipeline"]["selected_id"], "newer")
+        finally:
+            server.DRAFT_PIPELINE_JSON = previous_pipeline_path
+            server.PUBLISH_RESULT_JSON = previous_publish_result_path
+
     def test_local_upload_is_embedded_only_in_publish_payload(self) -> None:
         previous_media_dir = server.MEDIA_DIR
         try:

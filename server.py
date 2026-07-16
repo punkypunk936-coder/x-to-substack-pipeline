@@ -1471,6 +1471,33 @@ def pipeline_payload() -> Dict[str, Any]:
     }
 
 
+def selected_pipeline_draft() -> Optional[Dict[str, Any]]:
+    with DRAFT_LOCK:
+        pipeline = ensure_pipeline()
+        selected_id = str(pipeline.get("selected_id") or "")
+        selected = next(
+            (item for item in pipeline["items"] if str(item.get("id") or "") == selected_id),
+            None,
+        )
+        if not isinstance(selected, dict):
+            return None
+        draft = dict(selected)
+        draft["blocks"] = normalize_blocks(draft)
+        draft["body"] = blocks_plain_text(draft["blocks"])
+        return draft if is_draft_usable(draft) else None
+
+
+def bootstrap_payload() -> Dict[str, Any]:
+    last_publish = json.loads(PUBLISH_RESULT_JSON.read_text(encoding="utf-8")) if PUBLISH_RESULT_JSON.exists() else None
+    with DRAFT_LOCK:
+        return {
+            "draft": selected_pipeline_draft(),
+            "pipeline": pipeline_payload(),
+            "publish": publish_config(),
+            "last_publish": last_publish,
+        }
+
+
 def should_ingest_discovered_id(draft_id: str, existing_ids: set[str], allow_backfill: bool = False) -> bool:
     if not draft_id or draft_id in existing_ids:
         return False
@@ -1678,6 +1705,8 @@ class Handler(BaseHTTPRequestHandler):
             self.serve_file(UI_DIR / "app.js", "text/javascript; charset=utf-8")
         elif path == "/styles.css":
             self.serve_file(UI_DIR / "styles.css", "text/css; charset=utf-8")
+        elif path == "/api/bootstrap":
+            self.send_json(bootstrap_payload())
         elif path == "/api/current":
             last_publish = json.loads(PUBLISH_RESULT_JSON.read_text(encoding="utf-8")) if PUBLISH_RESULT_JSON.exists() else None
             self.send_json({"draft": current_draft(), "publish": publish_config(), "last_publish": last_publish})
