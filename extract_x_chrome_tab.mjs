@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const url = process.argv[2] || "";
 const browserApp = process.env.X_BROWSER_APP || "Google Chrome";
+const allowVisibleFallback = process.env.X_ALLOW_VISIBLE_CHROME_FALLBACK === "1";
 
 function finish(result, code = 0) {
   console.log(JSON.stringify(result));
@@ -134,23 +135,44 @@ on run argv
   set jsSource to read POSIX file jsPath as text
   tell application ${JSON.stringify(appName)}
     if (count of windows) = 0 then
-      activate
-      make new window
+      error "Chrome must already be running in the signed-in X profile."
     end if
-    set targetWindow to front window
-    set targetTab to make new tab at end of tabs of targetWindow with properties {URL:targetUrl}
-    repeat with i from 1 to 100
-      delay 0.25
-      if (loading of targetTab is false) then exit repeat
-    end repeat
-    delay 2
+    set originalWindowId to id of front window
+    set originalTabIndex to active tab index of front window
+    set workerWindow to make new window with properties {visible:false}
+    set workerWindowId to id of workerWindow
     try
-      execute targetTab javascript "Array.from(document.querySelectorAll('span, div, button')).find((el) => /^(Show more|Read more)$/i.test((el.innerText || '').trim()))?.click();"
+      set bounds of window id workerWindowId to {-20000, -20000, -18640, -19020}
+      set minimized of window id workerWindowId to true
+      set URL of active tab of window id workerWindowId to targetUrl
+      repeat with i from 1 to 100
+        set visible of window id workerWindowId to false
+        set minimized of window id workerWindowId to true
+        delay 0.25
+        if (loading of active tab of window id workerWindowId is false) then exit repeat
+      end repeat
+      delay 2
+      try
+        execute active tab of window id workerWindowId javascript "Array.from(document.querySelectorAll('span, div, button')).find((el) => /^(Show more|Read more)$/i.test((el.innerText || '').trim()))?.click();"
+      end try
+      delay 1
+      set resultText to execute active tab of window id workerWindowId javascript jsSource
+      close window id workerWindowId
+      try
+        set active tab index of window id originalWindowId to originalTabIndex
+        set index of window id originalWindowId to 1
+      end try
+      return resultText
+    on error errorMessage number errorNumber
+      try
+        close window id workerWindowId
+      end try
+      try
+        set active tab index of window id originalWindowId to originalTabIndex
+        set index of window id originalWindowId to 1
+      end try
+      error errorMessage number errorNumber
     end try
-    delay 1
-    set resultText to execute targetTab javascript jsSource
-    close targetTab
-    return resultText
   end tell
 end run
 `;
@@ -283,8 +305,8 @@ function resultFromParsed(parsed, source) {
       ok: false,
       status: isLoginWall(body) ? "login_required" : "weak_capture",
       message: isLoginWall(body)
-        ? "The Chrome tab is not logged into X in the active profile/window. Bring the logged-in Chrome profile window to front, then paste the link again."
-        : "Chrome opened X, but the article body was not visible/capturable. Expand the article in that Chrome tab, then paste the final article URL.",
+        ? "The hidden Chrome worker is not logged into X in the current Chrome profile."
+        : "The hidden Chrome worker loaded X, but the article body was not visible or capturable.",
       current_url: parsed.current_url,
       word_count: wordCount(body),
       preview: body.slice(0, 220),
@@ -292,7 +314,7 @@ function resultFromParsed(parsed, source) {
   }
   return {
     ok: true,
-    status: source === "existing_chrome_clipboard" ? "captured_existing_chrome_clipboard" : "captured_existing_chrome",
+    status: source === "existing_chrome_clipboard" ? "captured_existing_chrome_clipboard" : "captured_chrome_background",
     draft: {
       url,
       title: titleFromText(parsed.title && wordCount(parsed.title) >= 3 ? parsed.title : body),
@@ -330,12 +352,20 @@ try {
     }
   }
 
-  const result = resultFromParsed(parsed, "existing_chrome_tab");
+  const result = resultFromParsed(parsed, "existing_chrome_background");
   finish(result, result.ok ? 0 : 5);
 } catch (error) {
   const detail = String(error?.stderr || error?.message || error);
   const lower = detail.toLowerCase();
   if (detail.includes("-1723") || lower.includes("access not allowed") || (lower.includes("javascript") && lower.includes("apple"))) {
+    if (!allowVisibleFallback) {
+      finish({
+        ok: false,
+        status: "chrome_javascript_blocked",
+        message: "Chrome blocked background page extraction. Enable View > Developer > Allow JavaScript from Apple Events in Chrome.",
+        detail,
+      }, 6);
+    }
     try {
       const parsed = await extractFromChromeClipboard(url);
       if (!sameXTarget(url, parsed.current_url)) {
@@ -353,7 +383,7 @@ try {
       finish({
         ok: false,
         status: "chrome_automation_blocked",
-        message: "Chrome blocked direct extraction, and macOS blocked the clipboard fallback. Enable Chrome View > Developer > Allow JavaScript from Apple Events, or allow Codex/Terminal/osascript under System Settings > Privacy & Security > Accessibility.",
+        message: "Chrome blocked direct extraction, and macOS blocked the explicitly enabled visible fallback. Enable Chrome View > Developer > Allow JavaScript from Apple Events, or allow Codex/Terminal/osascript under System Settings > Privacy & Security > Accessibility.",
         detail: String(fallbackError?.stderr || fallbackError?.message || fallbackError),
       }, 6);
     }

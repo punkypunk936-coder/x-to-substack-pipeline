@@ -56,23 +56,46 @@ on run argv
   set jsSource to read POSIX file jsPath as «class utf8»
   tell application ${JSON.stringify(appName)}
     if (count of windows) = 0 then
-      activate
-      make new window
+      error "Chrome must already be running in the signed-in X profile."
     end if
-    set targetWindow to front window
-    set targetTab to make new tab at end of tabs of targetWindow with properties {URL:targetUrl}
-    repeat with i from 1 to 120
-      delay 0.25
-      if (loading of targetTab is false) then exit repeat
-    end repeat
-    delay 2
-    repeat with i from 1 to 14
-      execute targetTab javascript jsSource
-      delay 0.8
-    end repeat
-    set resultText to execute targetTab javascript "JSON.stringify(Object.values(window.__xSubstackArticleInbox || {}))"
-    close targetTab
-    return resultText
+    set originalWindowId to id of front window
+    set originalTabIndex to active tab index of front window
+    set workerWindow to make new window with properties {visible:false}
+    set workerWindowId to id of workerWindow
+    try
+      set bounds of window id workerWindowId to {-20000, -20000, -18640, -19020}
+      set minimized of window id workerWindowId to true
+      set URL of active tab of window id workerWindowId to targetUrl
+      repeat with i from 1 to 120
+        set visible of window id workerWindowId to false
+        set minimized of window id workerWindowId to true
+        delay 0.25
+        if (loading of active tab of window id workerWindowId is false) then exit repeat
+      end repeat
+      delay 2
+      repeat with i from 1 to 14
+        set visible of window id workerWindowId to false
+        set minimized of window id workerWindowId to true
+        execute active tab of window id workerWindowId javascript jsSource
+        delay 0.8
+      end repeat
+      set resultText to execute active tab of window id workerWindowId javascript "JSON.stringify(Object.values(window.__xSubstackArticleInbox || {}))"
+      close window id workerWindowId
+      try
+        set active tab index of window id originalWindowId to originalTabIndex
+        set index of window id originalWindowId to 1
+      end try
+      return resultText
+    on error errorMessage number errorNumber
+      try
+        close window id workerWindowId
+      end try
+      try
+        set active tab index of window id originalWindowId to originalTabIndex
+        set index of window id originalWindowId to 1
+      end try
+      error errorMessage number errorNumber
+    end try
   end tell
 end run
 `;
@@ -103,7 +126,7 @@ try {
   finish({
     ok: false,
     status: "discovery_failed",
-    message: "Could not check the X article feed in Chrome.",
+    message: "Could not check the X article feed in the hidden Chrome worker.",
     detail: String(error?.stderr || error?.message || error),
   }, 2);
 } finally {

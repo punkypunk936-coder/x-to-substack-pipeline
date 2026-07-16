@@ -38,7 +38,7 @@ The installed macOS LaunchAgent `com.manvinder.x-substack-bridge` starts the loc
 The tool tries, in order:
 
 1. Official X API via `X_BEARER_TOKEN`, including article fields and media.
-2. Existing logged-in Chrome tab on macOS.
+2. An invisible worker window in the existing logged-in Chrome profile on macOS.
 3. Logged-in X browser extraction through a persistent local Playwright profile.
 4. Public X embed extraction, only if it contains a real article body.
 5. HTML metadata extraction, only if it contains a real article body.
@@ -63,12 +63,18 @@ export X_BEARER_TOKEN="..."
 python3 server.py --host 127.0.0.1 --port 8788
 ```
 
-Without `X_BEARER_TOKEN`, the app first opens a new X tab in your already-running Google Chrome window, so it can reuse the Chrome profile where you are already logged in. Bring the logged-in Chrome profile window to the front before pasting the link if you use multiple Chrome profiles.
+Without `X_BEARER_TOKEN`, the app uses an invisible Chrome worker window so it can reuse the profile where X is already logged in without changing tabs or taking focus. Keep Chrome running in the signed-in profile. If you use multiple Chrome profiles, the worker follows the current Chrome profile.
 
-If Chrome blocks direct extraction, enable `View > Developer > Allow JavaScript from Apple Events` once. If macOS blocks the fallback, enable Codex/Terminal/osascript under `System Settings > Privacy & Security > Accessibility`. You can set a different Chromium app name with:
+If Chrome blocks direct extraction, enable `View > Developer > Allow JavaScript from Apple Events` once. You can set a different Chromium app name with:
 
 ```sh
 export X_BROWSER_APP="Google Chrome"
+```
+
+The old visible clipboard fallback is disabled by default so automatic work never steals focus. It can be enabled explicitly for troubleshooting only:
+
+```bash
+export X_ALLOW_VISIBLE_CHROME_FALLBACK=1
 ```
 
 The separate `.x-profile` browser is disabled by default. Only enable it explicitly if you want that fallback:

@@ -799,7 +799,7 @@ def run_node_extractor(script_name: str, url: str, timeout: int = 180) -> Dict[s
     except FileNotFoundError as exc:
         raise ValueError(f"Node.js is required for X extraction: {exc}") from exc
     except subprocess.TimeoutExpired as exc:
-        raise ValueError("X extraction timed out. Check the X/Chrome window and try again.") from exc
+        raise ValueError("The background X worker timed out. Keep signed-in Chrome running and try again.") from exc
 
     raw = proc.stdout.strip()
     try:
@@ -852,7 +852,7 @@ def build_draft(url: str) -> Dict[str, Any]:
             return draft
     detail = " ".join(errors[-3:])
     raise ValueError(
-        "Could not capture a real article body from that X URL. Bring your logged-in Chrome profile window to the front, "
+        "Could not capture a real article body from that X URL. Keep Chrome running in the profile where X is signed in, "
         "then paste the link again; or set X_BEARER_TOKEN before starting the server."
         + (f" Details: {detail}" if detail else "")
     )
