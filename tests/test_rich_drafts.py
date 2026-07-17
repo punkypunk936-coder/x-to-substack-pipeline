@@ -294,6 +294,26 @@ class RichDraftTests(unittest.TestCase):
         finally:
             server.MEDIA_DIR = previous_media_dir
 
+    def test_remote_x_image_is_embedded_for_substack_paste(self) -> None:
+        previous_download = server.download_remote_image
+        try:
+            server.download_remote_image = lambda url: "data:image/jpeg;base64,VEVTVA=="
+            ready = server.publish_ready_draft(
+                {
+                    "blocks": [
+                        {
+                            "type": "image",
+                            "url": "https://pbs.twimg.com/media/COVER?format=jpg&name=large",
+                            "alt": "Cover",
+                        }
+                    ]
+                }
+            )
+
+            self.assertEqual(ready["blocks"][0]["url"], "data:image/jpeg;base64,VEVTVA==")
+        finally:
+            server.download_remote_image = previous_download
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { articleExtractionSource } from "./x_article_dom.mjs";
 
 const execFileAsync = promisify(execFile);
 const url = process.argv[2] || "";
@@ -143,11 +144,12 @@ on run argv
     set workerWindowId to id of workerWindow
     try
       set bounds of window id workerWindowId to {-20000, -20000, -18640, -19020}
-      set minimized of window id workerWindowId to true
+      set visible of window id workerWindowId to true
+      set index of window id originalWindowId to 1
       set URL of active tab of window id workerWindowId to targetUrl
       repeat with i from 1 to 100
-        set visible of window id workerWindowId to false
-        set minimized of window id workerWindowId to true
+        set bounds of window id workerWindowId to {-20000, -20000, -18640, -19020}
+        set index of window id originalWindowId to 1
         delay 0.25
         if (loading of active tab of window id workerWindowId is false) then exit repeat
       end repeat
@@ -215,59 +217,7 @@ end run
 `;
 }
 
-const extractionJs = String.raw`
-(() => {
-  const clean = (text) => String(text || "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .filter((line, index, lines) => lines.indexOf(line) === index)
-    .filter((line) => ![
-      /^Home$/, /^Explore$/, /^Notifications$/, /^Messages$/, /^Grok$/, /^Bookmarks$/, /^Communities$/,
-      /^Premium$/, /^Profile$/, /^More$/, /^Post$/, /^Reply$/, /^Repost$/, /^Like$/, /^View post analytics$/,
-      /^Share post$/, /^Follow$/, /^Subscribe$/, /^Sign in$/, /^Log in$/, /^Relevant people$/,
-      /^What.s happening$/, /^Terms of Service$/, /^Privacy Policy$/, /^Cookie Policy$/,
-    ].some((pattern) => pattern.test(line)))
-    .join("\n");
-
-  const visible = (node) => {
-    const style = window.getComputedStyle(node);
-    const rect = node.getBoundingClientRect();
-    return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
-  };
-
-  const articleLink = Array.from(document.querySelectorAll("a[href]"))
-    .find((anchor) => /\/i\/article\/|\/article\//.test(anchor.getAttribute("href") || ""));
-  const candidates = Array.from(document.querySelectorAll("article, main, [data-testid='tweetText'], [data-testid='cellInnerDiv']"))
-    .filter(visible)
-    .map((node) => clean(node.innerText || node.textContent || ""))
-    .filter(Boolean)
-    .sort((a, b) => b.length - a.length);
-  const body = candidates[0] || clean(document.body.innerText || "");
-  const media = Array.from(document.querySelectorAll("article img[src], main img[src]"))
-    .map((img) => ({
-      type: "image",
-      url: img.currentSrc || img.src,
-      alt: img.alt || "X media",
-      width: String(img.naturalWidth || ""),
-      height: String(img.naturalHeight || ""),
-    }))
-    .filter((item) => /pbs\.twimg\.com\/media|ton\.twitter\.com|twimg\.com/.test(item.url))
-    .filter((item) => !/\/(profile_images|profile_banners|emoji)\//i.test(item.url))
-    .filter((item) => /pbs\.twimg\.com\/media|ton\.twitter\.com/i.test(item.url) || Math.max(Number(item.width || 0), Number(item.height || 0)) >= 320)
-    .filter((item, index, items) => items.findIndex((other) => other.url === item.url) === index);
-
-  return JSON.stringify({
-    body,
-    media,
-    title: articleLink?.innerText || document.querySelector("h1")?.innerText || document.title.replace(/\s*\/\s*X$/, ""),
-    current_url: location.href,
-    article_url: articleLink ? new URL(articleLink.getAttribute("href"), location.href).toString() : "",
-  });
-})()
-`;
+const extractionJs = articleExtractionSource();
 
 if (!url || !/^https?:\/\/(www\.)?(x|twitter)\.com\//i.test(url)) {
   finish({ ok: false, status: "bad_url", message: "Pass a valid X/Twitter article URL." }, 2);
@@ -312,6 +262,11 @@ function resultFromParsed(parsed, source) {
       preview: body.slice(0, 220),
     };
   }
+  const blocks = Array.isArray(parsed.blocks) ? [...parsed.blocks] : [];
+  const cover = parsed.cover_media && typeof parsed.cover_media === "object" ? parsed.cover_media : null;
+  if (cover?.url && !blocks.some((block) => block?.type === "image" && block.url === cover.url)) {
+    blocks.unshift({ ...cover, type: "image", layout: "wide" });
+  }
   return {
     ok: true,
     status: source === "existing_chrome_clipboard" ? "captured_existing_chrome_clipboard" : "captured_chrome_background",
@@ -321,8 +276,10 @@ function resultFromParsed(parsed, source) {
       subtitle: "",
       date: new Date().toISOString().slice(0, 10),
       body,
+      blocks,
       media,
       source,
+      extraction_version: parsed.extraction_version || "x_text_v1",
       warnings: source === "existing_chrome_clipboard"
         ? ["Captured from the visible Chrome tab text because Chrome blocked direct page extraction."]
         : [],

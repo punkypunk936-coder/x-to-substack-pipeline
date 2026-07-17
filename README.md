@@ -37,9 +37,9 @@ The installed macOS LaunchAgent `com.manvinder.x-substack-bridge` starts the loc
 
 The tool tries, in order:
 
-1. Official X API via `X_BEARER_TOKEN`, including article fields and media.
-2. An invisible worker window in the existing logged-in Chrome profile on macOS.
-3. Logged-in X browser extraction through a persistent local Playwright profile.
+1. An invisible worker window in the existing logged-in Chrome profile on macOS. This is the exact rich DOM path and preserves links, block formatting, and cover media.
+2. Logged-in X browser extraction through a persistent local Playwright profile.
+3. Official X API via `X_BEARER_TOKEN`, including article fields and media.
 4. Public X embed extraction, only if it contains a real article body.
 5. HTML metadata extraction, only if it contains a real article body.
 

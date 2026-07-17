@@ -38,7 +38,7 @@ export function blockPlainText(block) {
   if (["paragraph", "heading", "subheading", "quote", "code"].includes(block.type)) return stripHtml(block.html);
   if (["bullet_list", "numbered_list"].includes(block.type)) return (block.items || []).map(stripHtml).join("\n");
   if (block.type === "embed") return block.url || "";
-  return [block.alt, block.caption].filter(Boolean).join(" ");
+  return block.caption || "";
 }
 
 export function draftPlainText(draft) {
@@ -70,4 +70,21 @@ export function draftBodyHtml(draft) {
 
 export function imageCount(draft) {
   return draftBlocks(draft).filter((block) => block.type === "image" && block.url).length;
+}
+
+export function draftStructure(draft) {
+  const blocks = draftBlocks(draft);
+  const bodyHtml = draftBodyHtml(draft);
+  const countTags = (pattern) => (bodyHtml.match(pattern) || []).length;
+  return {
+    images: blocks.filter((block) => block.type === "image" && block.url).length,
+    links: countTags(/<a\s[^>]*href=/gi),
+    headings: blocks.filter((block) => block.type === "heading" || block.type === "subheading").length,
+    quotes: blocks.filter((block) => block.type === "quote").length,
+    list_items: blocks
+      .filter((block) => block.type === "bullet_list" || block.type === "numbered_list")
+      .reduce((total, block) => total + (block.items || []).length, 0),
+    bold: countTags(/<(strong|b)(\s|>)/gi),
+    italic: countTags(/<(em|i)(\s|>)/gi),
+  };
 }

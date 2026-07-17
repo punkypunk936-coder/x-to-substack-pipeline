@@ -58,6 +58,7 @@ IMAGE_MIME_EXTENSIONS = {
     "image/webp": ".webp",
 }
 MAX_MEDIA_BYTES = 12 * 1024 * 1024
+MAX_REMOTE_MEDIA_BYTES = 12 * 1024 * 1024
 
 
 UA = (
@@ -490,6 +491,35 @@ def media_file_from_url(url: str) -> Optional[Path]:
     return candidate if candidate.is_file() else None
 
 
+def download_remote_image(url: str) -> Optional[str]:
+    """Make a remote image pasteable by Substack's editor.
+
+    Substack can accept image files from a paste, but it does not reliably
+    ingest an external <img src="https://..."> from synthetic clipboard HTML.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return None
+    request = urllib.request.Request(
+        url,
+        headers={
+            "accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "user-agent": UA,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=25, context=ssl_context()) as response:
+            content_type = (response.headers.get_content_type() or "").lower()
+            if not content_type.startswith("image/"):
+                return None
+            raw = response.read(MAX_REMOTE_MEDIA_BYTES + 1)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+    if not raw or len(raw) > MAX_REMOTE_MEDIA_BYTES:
+        return None
+    return f"data:{content_type};base64,{base64.b64encode(raw).decode('ascii')}"
+
+
 def publish_ready_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     ready = dict(draft)
     blocks = normalize_blocks(draft)
@@ -501,6 +531,10 @@ def publish_ready_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
             if path:
                 mime_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
                 item["url"] = f"data:{mime_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+            elif str(item.get("url") or "").startswith(("http://", "https://")):
+                embedded = download_remote_image(str(item["url"]))
+                if embedded:
+                    item["url"] = embedded
         publish_blocks.append(item)
     ready["blocks"] = publish_blocks
     ready["body"] = blocks_plain_text(publish_blocks)
@@ -649,6 +683,19 @@ def walk(obj: Any) -> List[Any]:
     return out
 
 
+def is_x_media_url(value: Any) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(str(value or ""))
+    except ValueError:
+        return False
+    host = parsed.netloc.lower().split(":", 1)[0]
+    return (
+        parsed.scheme.lower() in {"http", "https"}
+        and (host.endswith(".twimg.com") or host.endswith(".twitter.com"))
+        and not re.search(r"/(profile_images|profile_banners|emoji|hashflags)/", parsed.path, re.I)
+    )
+
+
 def extract_media(payload: Dict[str, Any]) -> List[Dict[str, str]]:
     media: List[Dict[str, str]] = []
     seen: set[str] = set()
@@ -675,7 +722,7 @@ def extract_media(payload: Dict[str, Any]) -> List[Dict[str, str]]:
             continue
         for key in ("url", "preview_image_url"):
             url = node.get(key)
-            if isinstance(url, str) and re.search(r"\.(png|jpe?g|webp)(\?|$)", url, re.I) and url not in seen:
+            if isinstance(url, str) and (is_x_media_url(url) or re.search(r"\.(png|jpe?g|webp|gif)(\?|$)", url, re.I)) and url not in seen:
                 seen.add(url)
                 media.append({"type": "image", "url": url, "alt": "X media", "width": "", "height": ""})
     return media
@@ -841,7 +888,8 @@ def draft_from_logged_in_browser(url: str) -> Optional[Dict[str, Any]]:
 def build_draft(url: str) -> Dict[str, Any]:
     normalized = normalize_x_url(url)
     errors: List[str] = []
-    for builder in (draft_from_x_api, draft_from_existing_chrome, draft_from_logged_in_browser, draft_from_oembed, draft_from_meta):
+    # The authenticated DOM is the only path that can preserve X's rich block tree.
+    for builder in (draft_from_existing_chrome, draft_from_logged_in_browser, draft_from_x_api, draft_from_oembed, draft_from_meta):
         try:
             draft = builder(normalized)
         except Exception as exc:
