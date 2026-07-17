@@ -25,6 +25,8 @@ let pipelineRenderKey = "";
 let pipelineRefreshTimer = null;
 let pipelineRefreshInFlight = false;
 let syncInFlight = false;
+let ingestConfigured = false;
+let publishConfigured = false;
 
 function setStatus(message, mode = "idle") {
   const node = $("#statusLine");
@@ -36,6 +38,24 @@ function setSaveState(message, mode = "saved") {
   const node = $("#saveState");
   node.textContent = message;
   node.className = `save-state ${mode === "saved" ? "" : mode}`.trim();
+}
+
+function configureConnections(data) {
+  ingestConfigured = Boolean(data.ingest?.configured);
+  publishConfigured = Boolean(data.publish?.configured);
+
+  const ingestMessage = data.ingest?.message || "Official X API connection is not configured.";
+  const publishMessage = data.publish?.message || "No browser-free publishing connection is available.";
+  const ingestButton = $("#ingestButton");
+  const draftButton = $("#substackDraftButton");
+  const publishButton = $("#publishButton");
+
+  ingestButton.disabled = !ingestConfigured;
+  ingestButton.title = ingestMessage;
+  draftButton.disabled = !publishConfigured;
+  draftButton.title = publishMessage;
+  publishButton.disabled = !publishConfigured;
+  publishButton.title = publishMessage;
 }
 
 function uid() {
@@ -700,6 +720,10 @@ async function syncDrafts({ silent = false } = {}) {
 }
 
 async function ingest() {
+  if (!ingestConfigured) {
+    setStatus("Add X_BEARER_TOKEN to enable exact API capture. Chrome will not be opened.", "error");
+    return;
+  }
   const url = $("#xUrl").value.trim();
   if (!url) {
     setStatus("Paste an X article URL first.", "error");
@@ -715,11 +739,15 @@ async function ingest() {
   } catch (error) {
     setStatus(error.message, "error");
   } finally {
-    $("#ingestButton").disabled = false;
+    $("#ingestButton").disabled = !ingestConfigured;
   }
 }
 
 async function sendToSubstack(mode) {
+  if (!publishConfigured) {
+    setStatus("Substack has no browser-free write API. This dashboard will not open Chrome or fake a publish.", "error");
+    return;
+  }
   if (!currentDraft) {
     setStatus("Create a draft first.", "error");
     return;
@@ -745,7 +773,7 @@ async function sendToSubstack(mode) {
     $("#publishLine").textContent = error.message;
     setStatus(error.message, "error");
   } finally {
-    button.disabled = false;
+    button.disabled = !publishConfigured;
   }
 }
 
@@ -880,9 +908,13 @@ async function loadCurrent() {
   const pipeline = data.pipeline;
   renderPipeline(pipeline, { force: true });
   if (data.draft) renderDraft(data.draft);
+  configureConnections(data);
   $("#loadingWorkspace").classList.add("hidden");
   $("#workspace").classList.add("workspace-ready");
-  setStatus("Dashboard ready.", "ok");
+  setStatus(
+    ingestConfigured ? "Dashboard ready. API-only capture is active." : data.ingest?.message || "Dashboard ready.",
+    ingestConfigured ? "ok" : "error",
+  );
   return pipeline;
 }
 

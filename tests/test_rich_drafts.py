@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,99 @@ import server
 
 
 class RichDraftTests(unittest.TestCase):
+    def test_official_x_article_preserves_banner_links_and_inline_media(self) -> None:
+        body = "Read the linked words exactly as written.\n\nThe second paragraph keeps the article structure intact."
+        link_text = "linked words"
+        link_start = body.index(link_text)
+        payload = {
+            "data": {
+                "id": "1234567890123456789",
+                "created_at": "2026-07-17T08:30:00.000Z",
+                "article": {
+                    "title": "Exact API capture",
+                    "subtitle": "Text, links, and media",
+                    "text": body,
+                    "entities": {
+                        "urls": [
+                            {
+                                "start": link_start,
+                                "end": link_start + len(link_text),
+                                "expanded_url": "https://example.com/source?ref=x",
+                            }
+                        ]
+                    },
+                    "cover_media": "3_cover",
+                    "media_entities": ["3_inline"],
+                },
+            },
+            "includes": {
+                "media": [
+                    {
+                        "media_key": "3_cover",
+                        "type": "photo",
+                        "url": "https://pbs.twimg.com/media/COVER?format=jpg&name=large",
+                        "alt_text": "Article banner",
+                    },
+                    {
+                        "media_key": "3_inline",
+                        "type": "photo",
+                        "url": "https://pbs.twimg.com/media/INLINE?format=png&name=large",
+                        "alt_text": "Inline chart",
+                    },
+                ]
+            },
+        }
+
+        draft = server.draft_from_x_payload("https://x.com/0xgoodie/status/1234567890123456789", payload)
+
+        self.assertIsNotNone(draft)
+        assert draft is not None
+        self.assertEqual([block["type"] for block in draft["blocks"]], ["image", "paragraph", "paragraph", "image"])
+        self.assertEqual(draft["blocks"][0]["layout"], "wide")
+        self.assertEqual(draft["blocks"][0]["alt"], "Article banner")
+        self.assertEqual(draft["blocks"][-1]["alt"], "Inline chart")
+        self.assertIn(
+            '<a href="https://example.com/source?ref=x" target="_blank" rel="noopener noreferrer">linked words</a>',
+            draft["blocks"][1]["html"],
+        )
+        self.assertNotIn("display_url", draft["blocks"][1]["html"])
+        self.assertFalse(draft["fidelity"]["browser_used"])
+
+    def test_official_x_article_rejects_unresolved_media(self) -> None:
+        payload = {
+            "data": {
+                "article": {
+                    "title": "Incomplete media response",
+                    "text": "This article has enough exact source words to exercise strict media validation without creating a partial draft.",
+                    "cover_media": "3_missing",
+                }
+            },
+            "includes": {"media": []},
+        }
+
+        with self.assertRaisesRegex(ValueError, "unresolved Article media"):
+            server.draft_from_x_payload("https://x.com/0xgoodie/status/1234567890123456789", payload)
+
+    def test_missing_x_token_never_falls_back_to_browser(self) -> None:
+        previous_token = os.environ.pop("X_BEARER_TOKEN", None)
+        previous_api = server.draft_from_x_api
+        try:
+            server.draft_from_x_api = lambda _url: self.fail("The API request should not run without a token")
+            with self.assertRaisesRegex(ValueError, "Chrome will not be opened"):
+                server.build_draft("https://x.com/0xgoodie/status/1234567890123456789")
+        finally:
+            server.draft_from_x_api = previous_api
+            if previous_token is not None:
+                os.environ["X_BEARER_TOKEN"] = previous_token
+
+    def test_substack_publish_connection_is_api_only_and_unavailable(self) -> None:
+        config = server.publish_config()
+
+        self.assertEqual(config["mode"], "api_only")
+        self.assertFalse(config["browser_automation"])
+        self.assertFalse(config["write_api_available"])
+        self.assertFalse(config["configured"])
+
     def test_legacy_draft_becomes_ordered_blocks(self) -> None:
         draft = {
             "body": "Opening paragraph with enough words to remain useful.\n\n## A real heading\n\nClosing paragraph.",

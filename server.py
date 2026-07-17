@@ -14,8 +14,6 @@ import os
 import re
 import shutil
 import ssl
-import subprocess
-import sys
 import threading
 import time
 import urllib.error
@@ -39,7 +37,6 @@ DIST_DIR = ROOT / "dist"
 CURRENT_JSON = DATA_DIR / "current_draft.json"
 PUBLISH_PAYLOAD_JSON = DATA_DIR / "publish_payload.json"
 PUBLISH_RESULT_JSON = DATA_DIR / "publish_result.json"
-X_EXTRACT_RESULT_JSON = DATA_DIR / "x_extract_result.json"
 DRAFT_PIPELINE_JSON = DATA_DIR / "draft_pipeline.json"
 SYNC_STATE_JSON = DATA_DIR / "sync_state.json"
 MEDIA_DIR = DATA_DIR / "media"
@@ -61,10 +58,7 @@ MAX_MEDIA_BYTES = 12 * 1024 * 1024
 MAX_REMOTE_MEDIA_BYTES = 12 * 1024 * 1024
 
 
-UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
-)
+UA = "ManvinderWritingDesk/1.0"
 
 
 try:
@@ -94,36 +88,6 @@ def ssl_context() -> ssl.SSLContext:
     if certifi is not None:
         return ssl.create_default_context(cafile=certifi.where())
     return ssl.create_default_context()
-
-
-class MetaParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.meta: Dict[str, str] = {}
-        self.title_parts: List[str] = []
-        self.in_title = False
-
-    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
-        attr = {k.lower(): v or "" for k, v in attrs}
-        if tag.lower() == "title":
-            self.in_title = True
-        if tag.lower() == "meta":
-            key = attr.get("property") or attr.get("name")
-            value = attr.get("content")
-            if key and value:
-                self.meta[key.lower()] = value.strip()
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag.lower() == "title":
-            self.in_title = False
-
-    def handle_data(self, data: str) -> None:
-        if self.in_title and data.strip():
-            self.title_parts.append(data.strip())
-
-    @property
-    def title(self) -> str:
-        return " ".join(self.title_parts).strip()
 
 
 class TextParser(HTMLParser):
@@ -652,16 +616,6 @@ def is_draft_usable(draft: Dict[str, Any]) -> bool:
     return bool(media) and words >= 12
 
 
-def low_value_reason(source: str) -> str:
-    if source == "public_x_embed":
-        return "Public X only returned the embed/byline, not the article body."
-    if source == "html_meta":
-        return "X only exposed page metadata, not the article body."
-    if source == "x_logged_in_browser":
-        return "X showed a login wall instead of the article body."
-    return "Extractor did not return enough article body to build a Substack draft."
-
-
 def first_str(obj: Dict[str, Any], keys: List[str]) -> str:
     for key in keys:
         value = obj.get(key)
@@ -670,62 +624,182 @@ def first_str(obj: Dict[str, Any], keys: List[str]) -> str:
     return ""
 
 
-def walk(obj: Any) -> List[Any]:
-    out: List[Any] = []
-    stack = [obj]
-    while stack:
-        cur = stack.pop()
-        out.append(cur)
-        if isinstance(cur, dict):
-            stack.extend(cur.values())
-        elif isinstance(cur, list):
-            stack.extend(cur)
-    return out
+def x_url_entities(entities: Any) -> List[Dict[str, Any]]:
+    if not isinstance(entities, dict) or not isinstance(entities.get("urls"), list):
+        return []
+    result: List[Dict[str, Any]] = []
+    for raw in entities["urls"]:
+        if not isinstance(raw, dict):
+            continue
+        indices = raw.get("indices") if isinstance(raw.get("indices"), list) else []
+        start = raw.get("start", indices[0] if len(indices) > 1 else None)
+        end = raw.get("end", indices[1] if len(indices) > 1 else None)
+        if not isinstance(start, int) or not isinstance(end, int) or start < 0 or end <= start:
+            continue
+        href = safe_web_url(first_str(raw, ["unwound_url", "expanded_url", "url"]), allow_mailto=True)
+        if not href:
+            continue
+        result.append({**raw, "start": start, "end": end, "href": href})
+    return sorted(result, key=lambda item: (int(item["start"]), int(item["end"])))
 
 
-def is_x_media_url(value: Any) -> bool:
-    try:
-        parsed = urllib.parse.urlparse(str(value or ""))
-    except ValueError:
-        return False
-    host = parsed.netloc.lower().split(":", 1)[0]
-    return (
-        parsed.scheme.lower() in {"http", "https"}
-        and (host.endswith(".twimg.com") or host.endswith(".twitter.com"))
-        and not re.search(r"/(profile_images|profile_banners|emoji|hashflags)/", parsed.path, re.I)
-    )
+def linked_segment_html(text: str, start_offset: int, entities: Any) -> str:
+    cursor = 0
+    parts: List[str] = []
+    segment_end = start_offset + len(text)
+    for entity in x_url_entities(entities):
+        start = int(entity["start"])
+        end = int(entity["end"])
+        if start < start_offset or end > segment_end:
+            continue
+        local_start = start - start_offset
+        local_end = end - start_offset
+        if local_start < cursor:
+            continue
+        parts.append(html.escape(text[cursor:local_start]).replace("\n", "<br>"))
+        visible = text[local_start:local_end]
+        parts.append(
+            f'<a href="{html.escape(str(entity["href"]), quote=True)}" target="_blank" rel="noopener noreferrer">'
+            f"{html.escape(visible)}</a>"
+        )
+        cursor = local_end
+    parts.append(html.escape(text[cursor:]).replace("\n", "<br>"))
+    return "".join(parts)
 
 
-def extract_media(payload: Dict[str, Any]) -> List[Dict[str, str]]:
-    media: List[Dict[str, str]] = []
-    seen: set[str] = set()
+def blocks_from_x_text(text: str, entities: Any) -> List[Dict[str, Any]]:
+    blocks: List[Dict[str, Any]] = []
+    for match in re.finditer(r"(?:[^\n]|\n(?!\n))+", text):
+        raw = match.group(0)
+        leading = len(raw) - len(raw.lstrip("\n"))
+        trailing = len(raw) - len(raw.rstrip("\n"))
+        content = raw[leading : len(raw) - trailing if trailing else len(raw)]
+        if not content.strip():
+            continue
+        blocks.append(
+            {
+                "id": block_id(),
+                "type": "paragraph",
+                "html": linked_segment_html(content, match.start() + leading, entities),
+            }
+        )
+    return blocks
+
+
+def media_key(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return first_str(value, ["media_key", "id", "key"])
+    return ""
+
+
+def raw_article_text(article: Dict[str, Any]) -> str:
+    for key in ("text", "body", "content", "preview_text"):
+        value = article.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def ordered_article_media(payload: Dict[str, Any], article: Dict[str, Any]) -> List[Dict[str, Any]]:
     includes = payload.get("includes") if isinstance(payload.get("includes"), dict) else {}
-    for item in includes.get("media", []) if isinstance(includes, dict) else []:
+    included = [item for item in includes.get("media", []) if isinstance(item, dict)] if isinstance(includes, dict) else []
+    by_key = {media_key(item): item for item in included if media_key(item)}
+    cover_key = media_key(article.get("cover_media"))
+    raw_order: List[Any] = [article.get("cover_media")]
+    article_media = article.get("media_entities")
+    if isinstance(article_media, list):
+        raw_order.extend(article_media)
+    raw_order.extend(included)
+
+    result: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_order:
+        item = by_key.get(media_key(raw), raw if isinstance(raw, dict) else None)
         if not isinstance(item, dict):
             continue
         url = first_str(item, ["url", "preview_image_url"])
         if not url or url in seen:
             continue
         seen.add(url)
-        media.append(
+        item_type = str(item.get("type") or "image")
+        if item_type not in {"image", "photo"}:
+            continue
+        key = media_key(item)
+        result.append(
             {
-                "type": str(item.get("type") or "image"),
+                "id": block_id(),
+                "type": "image",
                 "url": url,
-                "alt": first_str(item, ["alt_text"]) or "X media",
+                "alt": first_str(item, ["alt_text"]) or "Image",
+                "caption": "",
+                "layout": "wide" if cover_key and key == cover_key else "regular",
                 "width": str(item.get("width") or ""),
                 "height": str(item.get("height") or ""),
             }
         )
+    return result
 
-    for node in walk(payload.get("data", {})):
-        if not isinstance(node, dict):
-            continue
-        for key in ("url", "preview_image_url"):
-            url = node.get(key)
-            if isinstance(url, str) and (is_x_media_url(url) or re.search(r"\.(png|jpe?g|webp|gif)(\?|$)", url, re.I)) and url not in seen:
-                seen.add(url)
-                media.append({"type": "image", "url": url, "alt": "X media", "width": "", "height": ""})
-    return media
+
+def draft_from_x_payload(url: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    article = data.get("article") if isinstance(data.get("article"), dict) else {}
+    if not article:
+        return None
+    # Entity offsets refer to the unmodified Article text. Cleaning or trimming it
+    # before link reconstruction shifts those offsets and corrupts hyperlinks.
+    body = raw_article_text(article)
+    if not body.strip():
+        return None
+    entities = article.get("entities") if isinstance(article.get("entities"), dict) else data.get("entities")
+    text_blocks = blocks_from_x_text(body, entities)
+    media_blocks = ordered_article_media(payload, article)
+    expected_links = len(x_url_entities(entities))
+    rendered_links = sum(str(block.get("html") or "").count("<a ") for block in text_blocks)
+    if rendered_links != expected_links:
+        raise ValueError("X returned link offsets that do not match the Article text; no incomplete draft was created.")
+    article_media_refs = article.get("media_entities") if isinstance(article.get("media_entities"), list) else []
+    referenced_media = {
+        media_key(item)
+        for item in [article.get("cover_media"), *article_media_refs]
+        if media_key(item)
+    }
+    resolved_media = {
+        media_key(item)
+        for item in (payload.get("includes", {}).get("media", []) if isinstance(payload.get("includes"), dict) else [])
+        if isinstance(item, dict) and media_key(item)
+    }
+    if referenced_media - resolved_media:
+        raise ValueError("X returned unresolved Article media; no incomplete draft was created.")
+    cover = [block for block in media_blocks if block.get("layout") == "wide"]
+    inline_media = [block for block in media_blocks if block.get("layout") != "wide"]
+    blocks = cover + text_blocks + inline_media
+    title = first_str(article, ["title", "name"]) or infer_title(body)
+    subtitle = first_str(article, ["subtitle", "dek", "description", "preview_text"])
+    created = first_str(data, ["created_at"])
+    date = created[:10] if re.match(r"\d{4}-\d{2}-\d{2}", created) else dt.date.today().isoformat()
+    return {
+        "url": url,
+        "title": title,
+        "subtitle": subtitle,
+        "date": date,
+        "body": blocks_plain_text(blocks),
+        "blocks": blocks,
+        "media": media_blocks,
+        "source": "x_api",
+        "extraction_version": "x_official_api_v1",
+        "warnings": [
+            "X's official API preserves Article text, link targets, cover media, and inline media, but does not expose the full X editor block layout."
+        ],
+        "fidelity": {
+            "text": True,
+            "links": True,
+            "media": True,
+            "browser_used": False,
+            "rich_layout": False,
+        },
+    }
 
 
 def draft_from_x_api(url: str) -> Optional[Dict[str, Any]]:
@@ -740,170 +814,17 @@ def draft_from_x_api(url: str) -> Optional[Dict[str, Any]]:
     }
     api_url = f"https://api.x.com/2/tweets/{urllib.parse.quote(x_id)}?{urllib.parse.urlencode(params)}"
     payload = request_json(api_url, {"authorization": f"Bearer {token}", "user-agent": UA})
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    article = data.get("article") if isinstance(data.get("article"), dict) else {}
-    note = data.get("note_tweet") if isinstance(data.get("note_tweet"), dict) else {}
-
-    body = first_str(article, ["text", "body", "content", "preview_text"])
-    if not body:
-        body = first_str(note, ["text"])
-    if not body:
-        body = first_str(data, ["text"])
-    body = clean_text(body)
-
-    title = first_str(article, ["title", "name"]) or infer_title(body)
-    subtitle = first_str(article, ["subtitle", "dek", "description", "preview_text"])
-    created = first_str(data, ["created_at"])
-    date = created[:10] if re.match(r"\d{4}-\d{2}-\d{2}", created) else dt.date.today().isoformat()
-    return {
-        "url": url,
-        "title": title,
-        "subtitle": subtitle,
-        "date": date,
-        "body": body,
-        "media": extract_media(payload),
-        "source": "x_api",
-        "warnings": [],
-    }
-
-
-def draft_from_oembed(url: str) -> Optional[Dict[str, Any]]:
-    endpoint = "https://publish.twitter.com/oembed?" + urllib.parse.urlencode(
-        {"url": url, "omit_script": "1", "dnt": "1"}
-    )
-    try:
-        payload = request_json(endpoint)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-        return None
-    parser = TextParser()
-    parser.feed(str(payload.get("html") or ""))
-    body = clean_text(parser.text)
-    if not body:
-        return None
-    draft = {
-        "url": url,
-        "title": infer_title(body),
-        "subtitle": "",
-        "date": dt.date.today().isoformat(),
-        "body": body,
-        "media": [],
-        "source": "public_x_embed",
-        "warnings": [
-            "Public X embed returned text only. Add X_BEARER_TOKEN to preserve long-form article fields and media."
-        ],
-    }
-    if not is_draft_usable(draft):
-        raise ValueError(low_value_reason("public_x_embed"))
-    return draft
-
-
-def draft_from_meta(url: str) -> Optional[Dict[str, Any]]:
-    try:
-        raw = request_text(url)
-    except (urllib.error.URLError, TimeoutError):
-        return None
-    parser = MetaParser()
-    parser.feed(raw)
-    meta = parser.meta
-    title = meta.get("og:title") or meta.get("twitter:title") or parser.title
-    description = meta.get("og:description") or meta.get("twitter:description") or ""
-    image = meta.get("og:image") or meta.get("twitter:image") or ""
-    if not title and not description:
-        return None
-    media = [{"type": "image", "url": image, "alt": title or "X media", "width": "", "height": ""}] if image else []
-    draft = {
-        "url": url,
-        "title": clean_text(title) or "Untitled X article",
-        "subtitle": "",
-        "date": dt.date.today().isoformat(),
-        "body": clean_text(description),
-        "media": media,
-        "source": "html_meta",
-        "warnings": [
-            "X did not expose full article text publicly. Add X_BEARER_TOKEN or use a logged-in browser flow for exact full article capture."
-        ],
-    }
-    if not is_draft_usable(draft):
-        raise ValueError(low_value_reason("html_meta"))
-    return draft
-
-
-def run_node_extractor(script_name: str, url: str, timeout: int = 180) -> Dict[str, Any]:
-    script = ROOT / script_name
-    if not script.exists():
-        return {}
-    env = os.environ.copy()
-    try:
-        proc = subprocess.run(
-            ["node", str(script), url],
-            cwd=str(ROOT),
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-        )
-    except FileNotFoundError as exc:
-        raise ValueError(f"Node.js is required for X extraction: {exc}") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise ValueError("The background X worker timed out. Keep signed-in Chrome running and try again.") from exc
-
-    raw = proc.stdout.strip()
-    try:
-        result = json.loads(raw.splitlines()[-1]) if raw else {}
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"X extraction returned unreadable output: {proc.stderr.strip()}") from exc
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    X_EXTRACT_RESULT_JSON.write_text(json.dumps(result, indent=2), encoding="utf-8")
-    if proc.returncode != 0 or not result.get("ok"):
-        message = str(result.get("message") or proc.stderr.strip() or "X extraction failed.")
-        raise ValueError(message)
-    return result
-
-
-def draft_from_existing_chrome(url: str) -> Optional[Dict[str, Any]]:
-    if sys.platform != "darwin" or os.environ.get("X_SKIP_EXISTING_CHROME") == "1":
-        return None
-    result = run_node_extractor("extract_x_chrome_tab.mjs", url, timeout=75)
-    draft = result.get("draft")
-    if not isinstance(draft, dict):
-        return None
-    if not is_draft_usable(draft):
-        raise ValueError(low_value_reason(str(draft.get("source") or "x_browser")))
-    return draft
-
-
-def draft_from_logged_in_browser(url: str) -> Optional[Dict[str, Any]]:
-    if os.environ.get("X_ALLOW_ISOLATED_X_PROFILE") != "1" or os.environ.get("X_SKIP_BROWSER_EXTRACT") == "1":
-        return None
-    result = run_node_extractor("extract_x_article.mjs", url, timeout=180)
-    draft = result.get("draft")
-    if not isinstance(draft, dict):
-        return None
-    if not is_draft_usable(draft):
-        raise ValueError(low_value_reason(str(draft.get("source") or "x_browser")))
-    return draft
+    return draft_from_x_payload(url, payload)
 
 
 def build_draft(url: str) -> Dict[str, Any]:
     normalized = normalize_x_url(url)
-    errors: List[str] = []
-    # The authenticated DOM is the only path that can preserve X's rich block tree.
-    for builder in (draft_from_existing_chrome, draft_from_logged_in_browser, draft_from_x_api, draft_from_oembed, draft_from_meta):
-        try:
-            draft = builder(normalized)
-        except Exception as exc:
-            errors.append(f"{builder.__name__}: {exc}")
-            draft = None
-        if draft and (draft.get("body") or draft.get("media")) and is_draft_usable(draft):
-            draft["warnings"] = list(draft.get("warnings") or []) + errors
-            return draft
-    detail = " ".join(errors[-3:])
-    raise ValueError(
-        "Could not capture a real article body from that X URL. Keep Chrome running in the profile where X is signed in, "
-        "then paste the link again; or set X_BEARER_TOKEN before starting the server."
-        + (f" Details: {detail}" if detail else "")
-    )
+    if not os.environ.get("X_BEARER_TOKEN"):
+        raise ValueError("Exact browser-free X Article capture requires X_BEARER_TOKEN. Chrome will not be opened.")
+    draft = draft_from_x_api(normalized)
+    if draft and is_draft_usable(draft):
+        return draft
+    raise ValueError("The official X API did not return a complete Article body, so no draft was created.")
 
 
 def media_html(media: List[Dict[str, str]]) -> str:
@@ -1269,12 +1190,7 @@ def publication_date_matches(item: Dict[str, Any], post: Dict[str, Any], max_day
 
 
 def substack_feed_url() -> str:
-    configured = os.environ.get("SUBSTACK_FEED_URL") or ""
-    if configured:
-        return configured
-    editor_url = os.environ.get("SUBSTACK_EDITOR_URL") or ""
-    parsed = urllib.parse.urlparse(editor_url)
-    return f"{parsed.scheme}://{parsed.netloc}/feed" if parsed.scheme and parsed.netloc else ""
+    return os.environ.get("SUBSTACK_FEED_URL") or ""
 
 
 def substack_archive_api_url() -> str:
@@ -1541,6 +1457,7 @@ def bootstrap_payload() -> Dict[str, Any]:
         return {
             "draft": selected_pipeline_draft(),
             "pipeline": pipeline_payload(),
+            "ingest": ingest_config(),
             "publish": publish_config(),
             "last_publish": last_publish,
         }
@@ -1556,6 +1473,47 @@ def should_ingest_discovered_id(draft_id: str, existing_ids: set[str], allow_bac
     return True
 
 
+def discover_x_articles_api() -> List[Dict[str, Any]]:
+    token = os.environ.get("X_BEARER_TOKEN")
+    if not token:
+        raise ValueError("X_BEARER_TOKEN is required for browser-free article sync.")
+    handle = str(os.environ.get("X_ACCOUNT_HANDLE") or "@0xgoodie").strip().lstrip("@")
+    headers = {"authorization": f"Bearer {token}", "user-agent": UA}
+    user_payload = request_json(f"https://api.x.com/2/users/by/username/{urllib.parse.quote(handle)}", headers)
+    user_data = user_payload.get("data") if isinstance(user_payload.get("data"), dict) else {}
+    user_id = str(user_data.get("id") or "")
+    if not user_id:
+        raise ValueError(f"The official X API could not resolve @{handle}.")
+    max_results = max(5, min(100, int(os.environ.get("X_SYNC_MAX_ARTICLES") or "30")))
+    params = {
+        "max_results": max_results,
+        "exclude": "retweets,replies",
+        "tweet.fields": "article,created_at",
+    }
+    timeline_url = (
+        f"https://api.x.com/2/users/{urllib.parse.quote(user_id)}/tweets?"
+        f"{urllib.parse.urlencode(params)}"
+    )
+    payload = request_json(timeline_url, headers)
+    posts = payload.get("data") if isinstance(payload.get("data"), list) else []
+    items: List[Dict[str, Any]] = []
+    for post in posts:
+        if not isinstance(post, dict) or not isinstance(post.get("article"), dict):
+            continue
+        post_id = str(post.get("id") or "")
+        if not post_id:
+            continue
+        article = post["article"]
+        items.append(
+            {
+                "id": post_id,
+                "url": f"https://x.com/{handle}/status/{post_id}",
+                "title": first_str(article, ["title", "name"]),
+            }
+        )
+    return sorted(items, key=lambda item: int(item["id"]), reverse=True)
+
+
 def sync_x_articles(base_url: str) -> Dict[str, Any]:
     if not SYNC_LOCK.acquire(blocking=False):
         return {"ok": True, "status": "already_syncing", "pipeline": pipeline_payload()}
@@ -1569,8 +1527,7 @@ def sync_x_articles(base_url: str) -> Dict[str, Any]:
         substack_ok = False
         reconciliation: Dict[str, Any] = {}
         try:
-            discovery = run_node_extractor("discover_x_articles.mjs", "", timeout=75)
-            discovered = list(discovery.get("items") or [])
+            discovered = discover_x_articles_api()
             x_ok = True
         except Exception as exc:
             errors.append(f"X sync: {exc}")
@@ -1638,15 +1595,30 @@ def auto_sync_loop(base_url: str) -> None:
         time.sleep(interval)
 
 
-def publish_config() -> Dict[str, Any]:
-    editor_url = os.environ.get("SUBSTACK_EDITOR_URL") or os.environ.get("SUBSTACK_PUBLISH_URL") or ""
+def ingest_config() -> Dict[str, Any]:
+    configured = bool(os.environ.get("X_BEARER_TOKEN"))
     return {
-        "editor_url": editor_url,
-        "profile_dir": os.environ.get("SUBSTACK_PROFILE_DIR") or str(ROOT / ".substack-profile"),
-        "browser": os.environ.get("SUBSTACK_BROWSER_APP") or "Google Chrome",
-        "existing_chrome": os.environ.get("SUBSTACK_USE_PLAYWRIGHT") != "1",
-        "direct_publish": os.environ.get("SUBSTACK_AUTOPUBLISH") == "1",
-        "configured": bool(editor_url),
+        "mode": "official_x_api",
+        "configured": configured,
+        "browser_automation": False,
+        "message": (
+            "Official X API capture is ready. Chrome is never used."
+            if configured
+            else "Add X_BEARER_TOKEN once to enable exact, browser-free X Article capture. Chrome will not be opened."
+        ),
+    }
+
+
+def publish_config() -> Dict[str, Any]:
+    return {
+        "mode": "api_only",
+        "configured": False,
+        "browser_automation": False,
+        "write_api_available": False,
+        "message": (
+            "Substack's official Developer API and MCP are read-only. "
+            "Browser publishing is disabled, so this dashboard will not claim a Substack publish succeeded."
+        ),
     }
 
 
@@ -1655,61 +1627,14 @@ def publish_to_substack(confirm_publish: bool, allow_publish: bool = False) -> D
     if not draft:
         raise ValueError("Create a draft from an X article first.")
     config = publish_config()
-    if not config["configured"]:
-        return {
-            "ok": False,
-            "status": "setup_required",
-            "message": "Set SUBSTACK_EDITOR_URL to your Substack new-post/editor URL, then restart this local server.",
-            "config": config,
-        }
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    PUBLISH_PAYLOAD_JSON.write_text(json.dumps(publish_ready_draft(draft), indent=2), encoding="utf-8")
-    env = os.environ.copy()
-    env["SUBSTACK_EDITOR_URL"] = str(draft.get("substack_draft_url") or config["editor_url"])
-    env["SUBSTACK_CONFIRM_PUBLISH"] = "1" if confirm_publish else "0"
-    env["SUBSTACK_AUTOPUBLISH"] = "1" if allow_publish else "0"
-    script = ROOT / (
-        "publish_to_substack.mjs"
-        if os.environ.get("SUBSTACK_USE_PLAYWRIGHT") == "1"
-        else "publish_to_substack_chrome.mjs"
-    )
-    try:
-        proc = subprocess.run(
-            ["node", str(script), str(PUBLISH_PAYLOAD_JSON)],
-            cwd=str(ROOT),
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=180,
-        )
-    except FileNotFoundError as exc:
-        return {
-            "ok": False,
-            "status": "setup_required",
-            "message": "Node.js is required for the Substack publisher connector.",
-            "detail": str(exc),
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "ok": False,
-            "status": "timeout",
-            "message": "Substack publish automation timed out. Check login state and try again.",
-        }
-    raw = proc.stdout.strip()
-    result: Dict[str, Any]
-    try:
-        result = json.loads(raw.splitlines()[-1]) if raw else {}
-    except json.JSONDecodeError:
-        result = {}
-    if proc.returncode != 0:
-        result = {
-            "ok": False,
-            "status": result.get("status") or "publish_failed",
-            "message": result.get("message") or "Substack publisher connector failed.",
-            "stdout": raw,
-            "stderr": proc.stderr.strip(),
-        }
+    PUBLISH_PAYLOAD_JSON.write_text(json.dumps(draft, indent=2), encoding="utf-8")
+    result = {
+        "ok": False,
+        "status": "substack_write_api_unavailable",
+        "message": config["message"],
+        "config": config,
+    }
     PUBLISH_RESULT_JSON.write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
 
@@ -1865,7 +1790,7 @@ def main() -> int:
     ensure_pipeline()
     watcher_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
     watcher_base_url = f"http://{watcher_host}:{args.port}"
-    if os.environ.get("X_AUTO_SYNC", "1") != "0":
+    if os.environ.get("X_AUTO_SYNC", "1") != "0" and ingest_config()["configured"]:
         threading.Thread(target=auto_sync_loop, args=(watcher_base_url,), daemon=True).start()
     with ThreadingHTTPServer((args.host, args.port), Handler) as httpd:
         print(f"X article to Substack draft tool running on http://{args.host}:{args.port}/")
