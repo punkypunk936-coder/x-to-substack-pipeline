@@ -10,6 +10,7 @@ data/x_extract_result.json
 data/draft_pipeline.json
 data/sync_state.json
 data/media/
+data/backups/
 dist/draft.html
 dist/substack-import.csv
 dist/feed.xml

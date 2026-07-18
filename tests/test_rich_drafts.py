@@ -82,17 +82,190 @@ class RichDraftTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unresolved Article media"):
             server.draft_from_x_payload("https://x.com/0xgoodie/status/1234567890123456789", payload)
 
-    def test_missing_x_token_never_falls_back_to_browser(self) -> None:
+    def test_build_draft_uses_the_rich_read_api_without_an_x_token(self) -> None:
         previous_token = os.environ.pop("X_BEARER_TOKEN", None)
-        previous_api = server.draft_from_x_api
+        previous_rich_api = server.draft_from_fxtwitter_api
+        previous_official_api = server.draft_from_x_api
         try:
-            server.draft_from_x_api = lambda _url: self.fail("The API request should not run without a token")
-            with self.assertRaisesRegex(ValueError, "Chrome will not be opened"):
-                server.build_draft("https://x.com/0xgoodie/status/1234567890123456789")
+            server.draft_from_fxtwitter_api = lambda url: {
+                "url": url,
+                "title": "Rich API article",
+                "body": "This complete rich API article contains enough exact words to pass validation without an X token or any browser fallback. It preserves every heading, list, quote, link, image, caption, and divider while keeping the article ready for careful editing inside the local writing dashboard.",
+                "blocks": [
+                    {
+                        "type": "paragraph",
+                        "html": "This complete rich API article contains enough exact words to pass validation without an X token or any browser fallback. It preserves every heading, list, quote, link, image, caption, and divider while keeping the article ready for careful editing inside the local writing dashboard.",
+                    }
+                ],
+                "media": [],
+            }
+            server.draft_from_x_api = lambda _url: self.fail("The lower-fidelity API should not run")
+
+            draft = server.build_draft("https://x.com/0xgoodie/status/1234567890123456789")
+
+            self.assertEqual(draft["title"], "Rich API article")
         finally:
-            server.draft_from_x_api = previous_api
+            server.draft_from_fxtwitter_api = previous_rich_api
+            server.draft_from_x_api = previous_official_api
             if previous_token is not None:
                 os.environ["X_BEARER_TOKEN"] = previous_token
+
+    def test_draftjs_article_preserves_rich_layout_unicode_links_and_media_positions(self) -> None:
+        payload = {
+            "code": 200,
+            "status": {
+                "created_at": "Fri Jul 17 03:00:46 +0000 2026",
+                "article": {
+                    "title": "Rich Draft.js article",
+                    "cover_media": {
+                        "media_id": "cover",
+                        "media_info": {
+                            "original_img_url": "https://pbs.twimg.com/media/COVER.jpg",
+                            "original_img_width": 1200,
+                            "original_img_height": 480,
+                        },
+                    },
+                    "media_entities": [
+                        {
+                            "media_id": "inline",
+                            "media_info": {
+                                "original_img_url": "https://pbs.twimg.com/media/INLINE.png",
+                                "original_img_width": 800,
+                                "original_img_height": 600,
+                            },
+                        }
+                    ],
+                    "content": {
+                        "entityMap": [
+                            {
+                                "key": "0",
+                                "value": {
+                                    "type": "LINK",
+                                    "data": {"url": "https://example.com/exact"},
+                                },
+                            },
+                            {
+                                "key": "1",
+                                "value": {
+                                    "type": "MEDIA",
+                                    "data": {
+                                        "caption": "Inline caption",
+                                        "mediaItems": [{"mediaId": "inline"}],
+                                    },
+                                },
+                            },
+                            {"key": "2", "value": {"type": "DIVIDER", "data": {}}},
+                        ],
+                        "blocks": [
+                            {
+                                "key": "p1",
+                                "type": "unstyled",
+                                "text": "🚀 linked bold",
+                                "inlineStyleRanges": [
+                                    {"offset": 3, "length": 6, "style": "Bold"},
+                                    {"offset": 10, "length": 4, "style": "Italic"},
+                                ],
+                                "entityRanges": [{"offset": 3, "length": 6, "key": 0}],
+                            },
+                            {"key": "h1", "type": "header-two", "text": "Heading", "inlineStyleRanges": [], "entityRanges": []},
+                            {"key": "l1", "type": "unordered-list-item", "text": "First", "inlineStyleRanges": [], "entityRanges": []},
+                            {"key": "l2", "type": "unordered-list-item", "text": "Second", "inlineStyleRanges": [], "entityRanges": []},
+                            {"key": "m1", "type": "atomic", "text": " ", "inlineStyleRanges": [], "entityRanges": [{"offset": 0, "length": 1, "key": 1}]},
+                            {"key": "d1", "type": "atomic", "text": " ", "inlineStyleRanges": [], "entityRanges": [{"offset": 0, "length": 1, "key": 2}]},
+                            {"key": "q1", "type": "blockquote", "text": "Quoted", "inlineStyleRanges": [], "entityRanges": []},
+                        ],
+                    },
+                },
+            },
+        }
+
+        draft = server.draft_from_fxtwitter_payload("https://x.com/0xgoodie/status/1234567890123456789", payload)
+
+        self.assertIsNotNone(draft)
+        assert draft is not None
+        self.assertEqual(
+            [block["type"] for block in draft["blocks"]],
+            ["image", "paragraph", "heading", "bullet_list", "image", "divider", "quote"],
+        )
+        self.assertEqual(draft["blocks"][0]["layout"], "wide")
+        self.assertEqual(draft["blocks"][4]["caption"], "Inline caption")
+        self.assertIn(
+            '<a href="https://example.com/exact" target="_blank" rel="noopener noreferrer"><strong>linked</strong></a>',
+            draft["blocks"][1]["html"],
+        )
+        self.assertIn("<em>bold</em>", draft["blocks"][1]["html"])
+        self.assertEqual(draft["blocks"][3]["items"], ["First", "Second"])
+        self.assertTrue(draft["fidelity"]["rich_layout"])
+
+    def test_rich_backfill_preserves_workflow_metadata(self) -> None:
+        previous_pipeline_path = server.DRAFT_PIPELINE_JSON
+        previous_backup_dir = server.PIPELINE_BACKUP_DIR
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                server.DRAFT_PIPELINE_JSON = Path(directory) / "pipeline.json"
+                server.PIPELINE_BACKUP_DIR = Path(directory) / "backups"
+                article_copy = "This exact article copy contains enough words to verify a safe rich-layout migration for an existing pipeline record."
+                server.DRAFT_PIPELINE_JSON.write_text(
+                    json.dumps(
+                        {
+                            "selected_id": None,
+                            "items": [
+                                {
+                                    "id": "1234567890123456789",
+                                    "url": "https://x.com/0xgoodie/status/1234567890123456789",
+                                    "title": "Existing article",
+                                    "body": article_copy,
+                                    "status": "published",
+                                    "substack_url": "https://example.substack.com/p/existing",
+                                    "published_at": "2026-07-17T03:00:46+00:00",
+                                }
+                            ],
+                        }
+                    )
+                )
+                replacement = {
+                    "url": "https://x.com/0xgoodie/status/1234567890123456789",
+                    "title": "Existing article",
+                    "body": article_copy,
+                    "blocks": [{"type": "paragraph", "html": article_copy}],
+                    "media": [],
+                    "source": "fxtwitter_read_api",
+                    "extraction_version": server.RICH_EXTRACTION_VERSION,
+                }
+
+                result = server.backfill_pipeline_drafts("http://127.0.0.1:8788", fetcher=lambda _url: replacement)
+                migrated = json.loads(server.DRAFT_PIPELINE_JSON.read_text())["items"][0]
+
+                self.assertEqual(result["upgraded"], ["1234567890123456789"])
+                self.assertEqual(migrated["extraction_version"], server.RICH_EXTRACTION_VERSION)
+                self.assertEqual(migrated["status"], "published")
+                self.assertEqual(migrated["substack_url"], "https://example.substack.com/p/existing")
+                self.assertTrue(Path(result["backup_path"]).exists())
+        finally:
+            server.DRAFT_PIPELINE_JSON = previous_pipeline_path
+            server.PIPELINE_BACKUP_DIR = previous_backup_dir
+
+    def test_rich_article_discovery_uses_article_titles_and_status_ids(self) -> None:
+        payload = {
+            "code": 200,
+            "results": [
+                {
+                    "id": "1234567890123456790",
+                    "url": "https://x.com/0xgoodie/status/1234567890123456790",
+                    "article": {"title": "Newer article"},
+                },
+                {
+                    "id": "1234567890123456789",
+                    "article": {"title": "Older article"},
+                },
+                {"id": "1234567890123456788", "text": "Regular post"},
+            ],
+        }
+
+        articles = server.discover_fxtwitter_articles_payload(payload, "0xgoodie")
+
+        self.assertEqual([item["id"] for item in articles], ["1234567890123456790", "1234567890123456789"])
+        self.assertEqual(articles[1]["url"], "https://x.com/0xgoodie/status/1234567890123456789")
 
     def test_substack_publish_connection_is_api_only_and_unavailable(self) -> None:
         config = server.publish_config()

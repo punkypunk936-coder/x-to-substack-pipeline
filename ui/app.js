@@ -694,9 +694,12 @@ async function syncDrafts({ silent = false } = {}) {
     const data = await api("/api/drafts/sync", { method: "POST", body: "{}" });
     renderPipeline(data.pipeline);
     const addedIds = data.added || [];
+    const upgradedIds = data.upgraded || [];
     const newlyPublished = data.newly_published || [];
     const targetId = addedIds[0] || data.pipeline.selected_id;
-    if (
+    if (!editorDirty && upgradedIds.includes(String(currentDraft?.id || ""))) {
+      await openDraft(currentDraft.id);
+    } else if (
       !editorDirty
       && targetId
       && String(currentDraft?.id || "") !== String(targetId)
@@ -705,6 +708,7 @@ async function syncDrafts({ silent = false } = {}) {
     }
     const updates = [];
     if (addedIds.length) updates.push(`${addedIds.length} new X article draft${addedIds.length === 1 ? "" : "s"} added`);
+    if (upgradedIds.length) updates.push(`${upgradedIds.length} existing draft${upgradedIds.length === 1 ? "" : "s"} restored to the X layout`);
     if (newlyPublished.length) updates.push(`${newlyPublished.length} Substack post${newlyPublished.length === 1 ? "" : "s"} marked published`);
     if (!silent || updates.length) {
       setStatus(updates.length ? `${updates.join(". ")}.` : "X and Substack are fully reconciled.", "ok");
@@ -721,7 +725,7 @@ async function syncDrafts({ silent = false } = {}) {
 
 async function ingest() {
   if (!ingestConfigured) {
-    setStatus("Add X_BEARER_TOKEN to enable exact API capture. Chrome will not be opened.", "error");
+    setStatus("The rich X Article read API is unavailable right now. Try again shortly.", "error");
     return;
   }
   const url = $("#xUrl").value.trim();
@@ -927,6 +931,14 @@ async function refreshPipelineState() {
     const currentItem = (pipeline.items || []).find(
       (item) => String(item.id || "") === String(currentDraft?.id || ""),
     );
+    if (
+      currentItem?.updated_at
+      && currentDraft?.updated_at
+      && currentItem.updated_at !== currentDraft.updated_at
+    ) {
+      await openDraft(currentItem.id);
+      return pipeline;
+    }
     if (
       pipeline.selected_id
       && String(currentDraft?.id || "") !== String(pipeline.selected_id)

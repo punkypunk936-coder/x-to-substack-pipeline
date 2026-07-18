@@ -40,6 +40,7 @@ PUBLISH_RESULT_JSON = DATA_DIR / "publish_result.json"
 DRAFT_PIPELINE_JSON = DATA_DIR / "draft_pipeline.json"
 SYNC_STATE_JSON = DATA_DIR / "sync_state.json"
 MEDIA_DIR = DATA_DIR / "media"
+PIPELINE_BACKUP_DIR = DATA_DIR / "backups"
 ENV_FILE = ROOT / ".env"
 DRAFT_LOCK = threading.RLock()
 SYNC_LOCK = threading.Lock()
@@ -59,6 +60,8 @@ MAX_REMOTE_MEDIA_BYTES = 12 * 1024 * 1024
 
 
 UA = "ManvinderWritingDesk/1.0"
+FXTWITTER_API_BASE = "https://api.fxtwitter.com"
+RICH_EXTRACTION_VERSION = "x_draftjs_api_v1"
 
 
 try:
@@ -694,6 +697,318 @@ def media_key(value: Any) -> str:
     return ""
 
 
+def utf16_offset_to_index(text: str, offset: int) -> int:
+    if offset < 0:
+        raise ValueError("Negative Draft.js text offset.")
+    units = 0
+    for index, character in enumerate(text):
+        if units == offset:
+            return index
+        units += 2 if ord(character) > 0xFFFF else 1
+        if units > offset:
+            raise ValueError("Draft.js range splits a Unicode character.")
+    if units == offset:
+        return len(text)
+    raise ValueError("Draft.js range exceeds its text block.")
+
+
+def draftjs_entity_map(content: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    raw = content.get("entityMap")
+    if isinstance(raw, dict):
+        return {str(key): value for key, value in raw.items() if isinstance(value, dict)}
+    if isinstance(raw, list):
+        result: Dict[str, Dict[str, Any]] = {}
+        for entry in raw:
+            if not isinstance(entry, dict) or not isinstance(entry.get("value"), dict):
+                continue
+            result[str(entry.get("key"))] = entry["value"]
+        return result
+    return {}
+
+
+def draftjs_inline_html(text: str, block: Dict[str, Any], entities: Dict[str, Dict[str, Any]]) -> str:
+    intervals: List[Dict[str, Any]] = []
+    style_tags = {
+        "bold": ("strong", 10),
+        "italic": ("em", 20),
+        "underline": ("u", 30),
+        "strikethrough": ("s", 40),
+        "code": ("code", 50),
+        "monospace": ("code", 50),
+    }
+
+    for index, raw in enumerate(block.get("inlineStyleRanges") or []):
+        if not isinstance(raw, dict):
+            continue
+        style = str(raw.get("style") or "").replace("_", "").replace("-", "").lower()
+        if style not in style_tags:
+            raise ValueError(f"Unsupported X Article inline style: {raw.get('style')}")
+        offset = raw.get("offset")
+        length = raw.get("length")
+        if not isinstance(offset, int) or not isinstance(length, int) or length <= 0:
+            continue
+        start = utf16_offset_to_index(text, offset)
+        end = utf16_offset_to_index(text, offset + length)
+        tag, priority = style_tags[style]
+        intervals.append(
+            {
+                "id": f"style-{index}",
+                "start": start,
+                "end": end,
+                "open": f"<{tag}>",
+                "close": f"</{tag}>",
+                "priority": priority,
+            }
+        )
+
+    for index, raw in enumerate(block.get("entityRanges") or []):
+        if not isinstance(raw, dict):
+            continue
+        entity = entities.get(str(raw.get("key")))
+        if not isinstance(entity, dict):
+            raise ValueError("X Article references a missing Draft.js entity.")
+        entity_type = str(entity.get("type") or "").upper()
+        if entity_type != "LINK":
+            if str(block.get("type") or "") == "atomic":
+                continue
+            raise ValueError(f"Unsupported inline X Article entity: {entity_type or 'unknown'}")
+        data = entity.get("data") if isinstance(entity.get("data"), dict) else {}
+        href = safe_web_url(first_str(data, ["url", "href", "expanded_url"]), allow_mailto=True)
+        if not href:
+            raise ValueError("X Article contains an invalid link target.")
+        offset = raw.get("offset")
+        length = raw.get("length")
+        if not isinstance(offset, int) or not isinstance(length, int) or length <= 0:
+            raise ValueError("X Article contains an invalid link range.")
+        start = utf16_offset_to_index(text, offset)
+        end = utf16_offset_to_index(text, offset + length)
+        intervals.append(
+            {
+                "id": f"entity-{index}",
+                "start": start,
+                "end": end,
+                "open": f'<a href="{html.escape(href, quote=True)}" target="_blank" rel="noopener noreferrer">',
+                "close": "</a>",
+                "priority": 0,
+            }
+        )
+
+    if not intervals:
+        return html.escape(text).replace("\n", "<br>")
+
+    boundaries = sorted({0, len(text), *(int(item["start"]) for item in intervals), *(int(item["end"]) for item in intervals)})
+    output: List[str] = []
+    active: List[Dict[str, Any]] = []
+    for boundary_index, start in enumerate(boundaries[:-1]):
+        end = boundaries[boundary_index + 1]
+        next_active = sorted(
+            [item for item in intervals if int(item["start"]) <= start < int(item["end"])],
+            key=lambda item: (int(item["priority"]), int(item["start"]), -int(item["end"]), str(item["id"])),
+        )
+        common = 0
+        while common < len(active) and common < len(next_active) and active[common]["id"] == next_active[common]["id"]:
+            common += 1
+        output.extend(str(item["close"]) for item in reversed(active[common:]))
+        output.extend(str(item["open"]) for item in next_active[common:])
+        output.append(html.escape(text[start:end]).replace("\n", "<br>"))
+        active = next_active
+    output.extend(str(item["close"]) for item in reversed(active))
+    return "".join(output)
+
+
+def fxtwitter_media_block(raw: Any, *, layout: str = "regular", caption: str = "") -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    info = raw.get("media_info") if isinstance(raw.get("media_info"), dict) else raw
+    url = first_str(info, ["original_img_url", "url", "preview_image_url"])
+    width = info.get("original_img_width") or info.get("width") or ""
+    height = info.get("original_img_height") or info.get("height") or ""
+    if url:
+        return {
+            "id": block_id(),
+            "type": "image",
+            "url": url,
+            "alt": first_str(raw, ["alt_text", "altText"]) or first_str(info, ["alt_text", "altText"]) or "Image",
+            "caption": clean_text(caption)[:500],
+            "layout": layout,
+            "width": str(width),
+            "height": str(height),
+            "x_media_id": str(raw.get("media_id") or ""),
+        }
+    video_info = info.get("video_info") if isinstance(info.get("video_info"), dict) else info
+    variants = video_info.get("variants") if isinstance(video_info.get("variants"), list) else []
+    videos = [
+        item
+        for item in variants
+        if isinstance(item, dict) and str(item.get("content_type") or "").startswith("video/") and safe_web_url(item.get("url"))
+    ]
+    if videos:
+        selected = max(videos, key=lambda item: int(item.get("bitrate") or 0))
+        return {
+            "id": block_id(),
+            "type": "embed",
+            "url": str(selected["url"]),
+            "caption": clean_text(caption)[:500] or "Video from X",
+            "x_media_id": str(raw.get("media_id") or ""),
+        }
+    return None
+
+
+def draftjs_blocks(article: Dict[str, Any]) -> List[Dict[str, Any]]:
+    content = article.get("content") if isinstance(article.get("content"), dict) else {}
+    raw_blocks = content.get("blocks") if isinstance(content.get("blocks"), list) else []
+    if not raw_blocks:
+        raise ValueError("The X Article API did not return its rich block document.")
+    entities = draftjs_entity_map(content)
+    article_media = article.get("media_entities") if isinstance(article.get("media_entities"), list) else []
+    media_by_id = {
+        str(item.get("media_id")): item
+        for item in article_media
+        if isinstance(item, dict) and item.get("media_id") is not None
+    }
+    used_media_ids: set[str] = set()
+    blocks: List[Dict[str, Any]] = []
+    cover = fxtwitter_media_block(article.get("cover_media"), layout="wide")
+    if cover:
+        blocks.append(cover)
+
+    pending_list_type = ""
+    pending_list_items: List[str] = []
+
+    def flush_list() -> None:
+        nonlocal pending_list_type, pending_list_items
+        if pending_list_items:
+            blocks.append({"id": block_id(), "type": pending_list_type, "items": pending_list_items})
+        pending_list_type = ""
+        pending_list_items = []
+
+    for raw in raw_blocks:
+        if not isinstance(raw, dict):
+            raise ValueError("X Article contains an invalid Draft.js block.")
+        raw_type = str(raw.get("type") or "unstyled")
+        text = str(raw.get("text") or "")
+        if raw_type in {"unordered-list-item", "ordered-list-item"}:
+            list_type = "bullet_list" if raw_type == "unordered-list-item" else "numbered_list"
+            if pending_list_type and pending_list_type != list_type:
+                flush_list()
+            pending_list_type = list_type
+            pending_list_items.append(draftjs_inline_html(text, raw, entities))
+            continue
+        flush_list()
+
+        if raw_type == "atomic":
+            ranges = raw.get("entityRanges") if isinstance(raw.get("entityRanges"), list) else []
+            if len(ranges) != 1 or not isinstance(ranges[0], dict):
+                raise ValueError("X Article contains an unresolved atomic block.")
+            entity = entities.get(str(ranges[0].get("key")))
+            if not isinstance(entity, dict):
+                raise ValueError("X Article atomic block references a missing entity.")
+            entity_type = str(entity.get("type") or "").upper()
+            data = entity.get("data") if isinstance(entity.get("data"), dict) else {}
+            if entity_type == "DIVIDER":
+                blocks.append({"id": block_id(), "type": "divider"})
+                continue
+            if entity_type == "MEDIA":
+                media_items = data.get("mediaItems") if isinstance(data.get("mediaItems"), list) else []
+                if not media_items:
+                    raise ValueError("X Article media block has no referenced media.")
+                for reference in media_items:
+                    media_id = str(reference.get("mediaId") or "") if isinstance(reference, dict) else ""
+                    media_block = fxtwitter_media_block(
+                        media_by_id.get(media_id),
+                        caption=str(data.get("caption") or ""),
+                    )
+                    if not media_block:
+                        raise ValueError("X Article contains unresolved inline media.")
+                    used_media_ids.add(media_id)
+                    blocks.append(media_block)
+                continue
+            if entity_type in {"EMBED", "LINK"}:
+                embed_url = safe_web_url(first_str(data, ["url", "href", "expanded_url"]))
+                if not embed_url:
+                    raise ValueError("X Article contains an invalid embed.")
+                blocks.append({"id": block_id(), "type": "embed", "url": embed_url, "caption": clean_text(str(data.get("caption") or ""))[:500]})
+                continue
+            raise ValueError(f"Unsupported X Article atomic entity: {entity_type or 'unknown'}")
+
+        type_map = {
+            "unstyled": "paragraph",
+            "paragraph": "paragraph",
+            "header-one": "heading",
+            "header-two": "heading",
+            "header-three": "subheading",
+            "header-four": "subheading",
+            "header-five": "subheading",
+            "header-six": "subheading",
+            "blockquote": "quote",
+            "code-block": "code",
+        }
+        if raw_type not in type_map:
+            raise ValueError(f"Unsupported X Article block type: {raw_type}")
+        blocks.append(
+            {
+                "id": block_id(raw.get("key")),
+                "type": type_map[raw_type],
+                "html": draftjs_inline_html(text, raw, entities),
+            }
+        )
+    flush_list()
+    unresolved_media = set(media_by_id) - used_media_ids
+    if unresolved_media:
+        raise ValueError("X Article returned inline media without a matching block position.")
+    return blocks
+
+
+def draft_from_fxtwitter_payload(url: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    status = payload.get("status") if isinstance(payload.get("status"), dict) else payload.get("tweet")
+    if not isinstance(status, dict):
+        return None
+    article = status.get("article") if isinstance(status.get("article"), dict) else {}
+    if not article:
+        return None
+    blocks = normalize_blocks({"blocks": draftjs_blocks(article)})
+    title = first_str(article, ["title", "name"])
+    if not title:
+        raise ValueError("X Article title is missing.")
+    created = first_str(status, ["created_at"])
+    try:
+        date = email.utils.parsedate_to_datetime(created).date().isoformat()
+    except (TypeError, ValueError, OverflowError):
+        article_created = first_str(article, ["created_at"])
+        date = article_created[:10] if re.match(r"\d{4}-\d{2}-\d{2}", article_created) else dt.date.today().isoformat()
+    media = [dict(block) for block in blocks if block.get("type") in MEDIA_BLOCK_TYPES]
+    return {
+        "url": url,
+        "title": title,
+        "subtitle": "",
+        "date": date,
+        "body": blocks_plain_text(blocks),
+        "blocks": blocks,
+        "media": media,
+        "source": "fxtwitter_read_api",
+        "extraction_version": RICH_EXTRACTION_VERSION,
+        "warnings": [],
+        "fidelity": {
+            "text": True,
+            "links": True,
+            "media": True,
+            "browser_used": False,
+            "rich_layout": True,
+        },
+    }
+
+
+def draft_from_fxtwitter_api(url: str) -> Optional[Dict[str, Any]]:
+    x_id = extract_x_id(url)
+    if not x_id:
+        return None
+    base = str(os.environ.get("FXTWITTER_API_BASE") or FXTWITTER_API_BASE).rstrip("/")
+    payload = request_json(f"{base}/2/status/{urllib.parse.quote(x_id)}", {"user-agent": UA})
+    if payload.get("code") not in {None, 200}:
+        raise ValueError(f"X Article read API returned status {payload.get('code')}.")
+    return draft_from_fxtwitter_payload(url, payload)
+
+
 def raw_article_text(article: Dict[str, Any]) -> str:
     for key in ("text", "body", "content", "preview_text"):
         value = article.get(key)
@@ -819,12 +1134,10 @@ def draft_from_x_api(url: str) -> Optional[Dict[str, Any]]:
 
 def build_draft(url: str) -> Dict[str, Any]:
     normalized = normalize_x_url(url)
-    if not os.environ.get("X_BEARER_TOKEN"):
-        raise ValueError("Exact browser-free X Article capture requires X_BEARER_TOKEN. Chrome will not be opened.")
-    draft = draft_from_x_api(normalized)
+    draft = draft_from_fxtwitter_api(normalized)
     if draft and is_draft_usable(draft):
         return draft
-    raise ValueError("The official X API did not return a complete Article body, so no draft was created.")
+    raise ValueError("The X Article read API did not return a complete rich document, so no draft was created.")
 
 
 def media_html(media: List[Dict[str, str]]) -> str:
@@ -1057,10 +1370,14 @@ def upsert_pipeline_draft(
     with DRAFT_LOCK:
         pipeline = ensure_pipeline()
         draft = dict(draft)
-        draft["blocks"] = normalize_blocks(draft)
-        draft["body"] = blocks_plain_text(draft["blocks"])
         draft_id = pipeline_draft_id(draft)
         existing = next((item for item in pipeline["items"] if str(item.get("id")) == draft_id), None)
+        if existing is not None:
+            merged = dict(existing)
+            merged.update(draft)
+            draft = merged
+        draft["blocks"] = normalize_blocks(draft)
+        draft["body"] = blocks_plain_text(draft["blocks"])
         timestamp = now_iso()
         draft.update(
             {
@@ -1514,6 +1831,111 @@ def discover_x_articles_api() -> List[Dict[str, Any]]:
     return sorted(items, key=lambda item: int(item["id"]), reverse=True)
 
 
+def discover_fxtwitter_articles_payload(payload: Dict[str, Any], handle: str) -> List[Dict[str, Any]]:
+    posts = payload.get("results") if isinstance(payload.get("results"), list) else []
+    items: List[Dict[str, Any]] = []
+    for post in posts:
+        if not isinstance(post, dict) or not isinstance(post.get("article"), dict):
+            continue
+        post_id = str(post.get("id") or "")
+        title = first_str(post["article"], ["title", "name"])
+        if not post_id or not title:
+            continue
+        items.append(
+            {
+                "id": post_id,
+                "url": first_str(post, ["url"]) or f"https://x.com/{handle}/status/{post_id}",
+                "title": title,
+            }
+        )
+    return sorted(items, key=lambda item: int(item["id"]), reverse=True)
+
+
+def discover_fxtwitter_articles_api() -> List[Dict[str, Any]]:
+    handle = str(os.environ.get("X_ACCOUNT_HANDLE") or "@0xgoodie").strip().lstrip("@")
+    base = str(os.environ.get("FXTWITTER_API_BASE") or FXTWITTER_API_BASE).rstrip("/")
+    payload = request_json(
+        f"{base}/2/profile/{urllib.parse.quote(handle)}/articles",
+        {"user-agent": UA},
+    )
+    if payload.get("code") not in {None, 200}:
+        raise ValueError(f"X Article list API returned status {payload.get('code')}.")
+    return discover_fxtwitter_articles_payload(payload, handle)
+
+
+def article_copy_text(draft: Dict[str, Any], *, prefer_blocks: bool = False) -> str:
+    if prefer_blocks and isinstance(draft.get("blocks"), list):
+        chunks = [
+            block_plain_text(block).strip()
+            for block in normalize_blocks(draft)
+            if block.get("type") not in MEDIA_BLOCK_TYPES and block.get("type") != "divider"
+        ]
+        return "\n".join(chunk for chunk in chunks if chunk)
+    body = str(draft.get("body") or "")
+    body = re.sub(r"(?im)^\s*Image\s*$", " ", body)
+    body = re.sub(r"!\[[^\]]*\]\([^\)]+\)", " ", body)
+    return body
+
+
+def article_copy_match_score(existing: Dict[str, Any], replacement: Dict[str, Any]) -> float:
+    def comparable(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+    old = comparable(article_copy_text(existing))
+    new = comparable(article_copy_text(replacement, prefer_blocks=True))
+    if not old or not new:
+        return 0.0
+    return difflib.SequenceMatcher(None, old, new, autojunk=False).ratio()
+
+
+def backfill_pipeline_drafts(
+    base_url: str,
+    fetcher: Optional[Any] = None,
+) -> Dict[str, Any]:
+    fetch = fetcher or build_draft
+    snapshot = read_pipeline()
+    selected_id = str(snapshot.get("selected_id") or "")
+    candidates = [
+        dict(item)
+        for item in snapshot.get("items", [])
+        if isinstance(item, dict) and str(item.get("extraction_version") or "") != RICH_EXTRACTION_VERSION
+    ]
+    upgraded: List[str] = []
+    skipped: List[Dict[str, str]] = []
+    backup_path = ""
+    for existing in candidates:
+        draft_id = str(existing.get("id") or "")
+        source_url = str(existing.get("url") or "")
+        try:
+            replacement = fetch(source_url)
+            if not isinstance(replacement, dict):
+                raise ValueError("No rich X Article document was returned.")
+            if pipeline_draft_id(replacement) != draft_id:
+                raise ValueError("Returned X Article ID does not match the pipeline record.")
+            if title_match_score(str(existing.get("title") or ""), str(replacement.get("title") or "")) < 0.95:
+                raise ValueError("Returned X Article title does not match the saved draft.")
+            copy_score = article_copy_match_score(existing, replacement)
+            if copy_score < 0.97:
+                raise ValueError(f"Returned article copy failed verification ({copy_score:.3f}).")
+            if not backup_path:
+                PIPELINE_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+                backup = PIPELINE_BACKUP_DIR / f"draft_pipeline-before-{RICH_EXTRACTION_VERSION}.json"
+                if not backup.exists():
+                    backup.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+                backup_path = str(backup)
+            upsert_pipeline_draft(replacement, base_url, select=False)
+            upgraded.append(draft_id)
+        except Exception as exc:
+            skipped.append({"id": draft_id, "error": str(exc)})
+    if selected_id and selected_id in upgraded:
+        select_pipeline_draft(selected_id, base_url)
+    return {
+        "upgraded": upgraded,
+        "skipped": skipped,
+        "backup_path": backup_path,
+    }
+
+
 def sync_x_articles(base_url: str) -> Dict[str, Any]:
     if not SYNC_LOCK.acquire(blocking=False):
         return {"ok": True, "status": "already_syncing", "pipeline": pipeline_payload()}
@@ -1522,12 +1944,13 @@ def sync_x_articles(base_url: str) -> Dict[str, Any]:
     try:
         discovered: List[Dict[str, Any]] = []
         added: List[str] = []
+        upgraded: List[str] = []
         errors: List[str] = []
         x_ok = False
         substack_ok = False
         reconciliation: Dict[str, Any] = {}
         try:
-            discovered = discover_x_articles_api()
+            discovered = discover_fxtwitter_articles_api()
             x_ok = True
         except Exception as exc:
             errors.append(f"X sync: {exc}")
@@ -1548,6 +1971,13 @@ def sync_x_articles(base_url: str) -> Dict[str, Any]:
             except Exception as exc:
                 errors.append(f"{url}: {exc}")
         try:
+            backfill = backfill_pipeline_drafts(base_url)
+            upgraded = list(backfill.get("upgraded") or [])
+            for skipped in backfill.get("skipped") or []:
+                errors.append(f"Rich backfill {skipped.get('id')}: {skipped.get('error')}")
+        except Exception as exc:
+            errors.append(f"Rich backfill: {exc}")
+        try:
             reconciliation = reconcile_substack_publications()
             substack_ok = True
         except Exception as exc:
@@ -1560,6 +1990,7 @@ def sync_x_articles(base_url: str) -> Dict[str, Any]:
             "last_error": " ".join(errors[-2:]) if errors else None,
             "discovered_count": len(discovered),
             "added_count": len(added),
+            "upgraded_count": len(upgraded),
             "substack_publication_count": reconciliation.get("publication_count", 0),
             "published_match_count": len(reconciliation.get("matched", [])),
             "substack_feed_url": reconciliation.get("feed_url") or substack_feed_url(),
@@ -1569,6 +2000,7 @@ def sync_x_articles(base_url: str) -> Dict[str, Any]:
             "ok": state["status"] != "error",
             "status": state["status"],
             "added": added,
+            "upgraded": upgraded,
             "published_matches": reconciliation.get("matched", []),
             "newly_published": reconciliation.get("updated", []),
             "publication_match_details": reconciliation.get("match_details", []),
@@ -1596,16 +2028,12 @@ def auto_sync_loop(base_url: str) -> None:
 
 
 def ingest_config() -> Dict[str, Any]:
-    configured = bool(os.environ.get("X_BEARER_TOKEN"))
     return {
-        "mode": "official_x_api",
-        "configured": configured,
+        "mode": "rich_x_read_api",
+        "configured": True,
         "browser_automation": False,
-        "message": (
-            "Official X API capture is ready. Chrome is never used."
-            if configured
-            else "Add X_BEARER_TOKEN once to enable exact, browser-free X Article capture. Chrome will not be opened."
-        ),
+        "rich_layout": True,
+        "message": "Rich X Article capture is active through a read-only API. Chrome is never used.",
     }
 
 
@@ -1790,7 +2218,7 @@ def main() -> int:
     ensure_pipeline()
     watcher_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
     watcher_base_url = f"http://{watcher_host}:{args.port}"
-    if os.environ.get("X_AUTO_SYNC", "1") != "0" and ingest_config()["configured"]:
+    if os.environ.get("X_AUTO_SYNC", "1") != "0":
         threading.Thread(target=auto_sync_loop, args=(watcher_base_url,), daemon=True).start()
     with ThreadingHTTPServer((args.host, args.port), Handler) as httpd:
         print(f"X article to Substack draft tool running on http://{args.host}:{args.port}/")
