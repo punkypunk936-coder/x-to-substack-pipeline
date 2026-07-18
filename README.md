@@ -1,6 +1,6 @@
 # Manvinder Writing Desk
 
-An API-only local workspace for capturing X Articles, preserving their text, links, and media, then editing them as structured drafts.
+A local writing workspace for capturing X Articles or starting original drafts, editing them as structured documents, and publishing to Substack.
 
 ## Run
 
@@ -45,11 +45,13 @@ Generated outputs:
 - `dist/feed.xml`
 - `dist/substack-import.csv`
 
-## Publishing Boundary
+## Substack Publishing
 
-Substack's official Developer API and MCP connection are read-only; neither provides post creation or publishing. Browser publishing is intentionally disabled, so the dashboard will not open Chrome or report a successful Substack publish that it cannot verify.
+`Save to Substack` creates or updates a real Substack draft. `Publish now` saves that same document, runs Substack's pre-publish check, publishes it to the web, and sends it to the configured audience after dashboard confirmation.
 
-Substack RSS and public archive reads remain available only to reconcile older pipeline records that were already published there. A truly browser-free Publish button needs a writable publication backend, such as a first-party writing site plus an email delivery API.
+The connector makes authenticated background requests using the existing signed-in Substack session stored in the local Chrome profile. It reads the encrypted local cookie store but never opens, focuses, or automates Chrome. Session values are not written to project files. Set `SUBSTACK_PUBLICATION_URL` explicitly or provide `SUBSTACK_FEED_URL`, from which the publication origin is derived. `SUBSTACK_CHROME_COOKIE_PATH` can select a specific Chrome profile when needed.
+
+Images are uploaded to Substack first. The dashboard block document is converted into Substack's current editor schema while preserving headings, lists, quotes, inline formatting, links, captions, and the cover image. Every write response is checked before the local pipeline is marked published.
 
 ## Service
 

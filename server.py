@@ -60,6 +60,10 @@ MAX_REMOTE_MEDIA_BYTES = 12 * 1024 * 1024
 
 
 UA = "ManvinderWritingDesk/1.0"
+SUBSTACK_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
+)
 FXTWITTER_API_BASE = "https://api.fxtwitter.com"
 RICH_EXTRACTION_VERSION = "x_draftjs_api_v1"
 
@@ -68,6 +72,13 @@ try:
     import certifi  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover
     certifi = None  # type: ignore[assignment]
+
+try:
+    import browser_cookie3  # type: ignore
+    import requests  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    browser_cookie3 = None  # type: ignore[assignment]
+    requests = None  # type: ignore[assignment]
 
 
 def load_env_file() -> None:
@@ -106,6 +117,54 @@ class TextParser(HTMLParser):
     @property
     def text(self) -> str:
         return " ".join(self.parts).strip()
+
+
+class ProseMirrorInlineParser(HTMLParser):
+    MARK_TAGS = {
+        "b": "strong",
+        "strong": "strong",
+        "i": "em",
+        "em": "em",
+        "u": "underline",
+        "s": "strike",
+        "strike": "strike",
+        "code": "code",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.nodes: List[Dict[str, Any]] = []
+        self.mark_stack: List[Tuple[str, Dict[str, Any]]] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        tag = tag.lower()
+        if tag == "br":
+            self.nodes.append({"type": "hard_break"})
+            return
+        mark_type = self.MARK_TAGS.get(tag)
+        mark: Optional[Dict[str, Any]] = {"type": mark_type} if mark_type else None
+        if tag == "a":
+            values = {key.lower(): value or "" for key, value in attrs}
+            href = safe_web_url(values.get("href"), allow_mailto=True)
+            if href:
+                mark = {"type": "link", "attrs": {"href": href, "target": "_blank"}}
+        if mark:
+            self.mark_stack.append((tag, mark))
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        for index in range(len(self.mark_stack) - 1, -1, -1):
+            if self.mark_stack[index][0] == tag:
+                self.mark_stack.pop(index)
+                break
+
+    def handle_data(self, data: str) -> None:
+        if not data:
+            return
+        node: Dict[str, Any] = {"type": "text", "text": data}
+        if self.mark_stack:
+            node["marks"] = [dict(mark) for _, mark in self.mark_stack]
+        self.nodes.append(node)
 
 
 class InlineHTMLSanitizer(HTMLParser):
@@ -418,6 +477,102 @@ def blocks_to_html(blocks: List[Dict[str, Any]]) -> str:
             caption = html.escape(str(block.get("caption") or ""))
             chunks.append(f'<p class="embed"><a href="{url}">{caption or url}</a></p>')
     return "\n".join(chunks)
+
+
+def inline_html_to_prosemirror(value: Any) -> List[Dict[str, Any]]:
+    parser = ProseMirrorInlineParser()
+    parser.feed(sanitize_inline_html(value))
+    parser.close()
+    return parser.nodes
+
+
+def substack_document(
+    draft: Dict[str, Any],
+    image_urls: Optional[Dict[str, str]] = None,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    image_urls = image_urls or {}
+    blocks = normalize_blocks(draft)
+    cover_block_id: Optional[str] = None
+    cover_url: Optional[str] = None
+    if blocks and blocks[0].get("type") == "image" and blocks[0].get("layout") in {"wide", "full"}:
+        cover_block_id = str(blocks[0].get("id") or "")
+        cover_url = image_urls.get(cover_block_id) or str(blocks[0].get("url") or "") or None
+
+    nodes: List[Dict[str, Any]] = []
+    for block in blocks:
+        block_type = str(block.get("type") or "paragraph")
+        block_id_value = str(block.get("id") or "")
+        if block_type == "image":
+            if block_id_value == cover_block_id:
+                continue
+            image_url = image_urls.get(block_id_value) or str(block.get("url") or "")
+            attrs = {
+                "src": image_url,
+                "fullscreen": True if block.get("layout") == "full" else None,
+                "imageSize": None,
+                "height": None,
+                "width": None,
+                "resizeWidth": None,
+                "bytes": None,
+                "alt": str(block.get("alt") or "") or None,
+                "title": None,
+                "type": None,
+                "href": None,
+                "belowTheFold": True,
+                "internalRedirect": None,
+            }
+            content: List[Dict[str, Any]] = [{"type": "image2", "attrs": attrs}]
+            caption = str(block.get("caption") or "").strip()
+            if caption:
+                content.append({"type": "caption", "content": [{"type": "text", "text": caption}]})
+            nodes.append({"type": "captionedImage", "content": content})
+            continue
+        if block_type == "divider":
+            nodes.append({"type": "horizontal_rule"})
+            continue
+        if block_type == "embed":
+            url = safe_web_url(block.get("url"))
+            if url:
+                label = str(block.get("caption") or url)
+                nodes.append(
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": label,
+                                "marks": [{"type": "link", "attrs": {"href": url, "target": "_blank"}}],
+                            }
+                        ],
+                    }
+                )
+            continue
+        if block_type in LIST_BLOCK_TYPES:
+            list_type = "bullet_list" if block_type == "bullet_list" else "ordered_list"
+            attrs: Dict[str, Any] = {"tight": False}
+            if list_type == "ordered_list":
+                attrs["order"] = 1
+            items = [
+                {"type": "list_item", "content": [{"type": "paragraph", "content": inline_html_to_prosemirror(item)}]}
+                for item in block.get("items") or []
+            ]
+            nodes.append({"type": list_type, "attrs": attrs, "content": items})
+            continue
+        content = inline_html_to_prosemirror(block.get("html") or "")
+        if block_type == "heading":
+            nodes.append({"type": "heading", "attrs": {"level": 2}, "content": content})
+        elif block_type == "subheading":
+            nodes.append({"type": "heading", "attrs": {"level": 3}, "content": content})
+        elif block_type in {"pull_quote", "quote"}:
+            nodes.append({"type": "blockquote", "content": [{"type": "paragraph", "content": content}]})
+        elif block_type == "code":
+            text = strip_inline_html(str(block.get("html") or ""))
+            nodes.append({"type": "code_block", "content": [{"type": "text", "text": text}] if text else []})
+        else:
+            nodes.append({"type": "paragraph", "content": content})
+    if not nodes:
+        nodes.append({"type": "paragraph"})
+    return {"type": "doc", "content": nodes}, cover_url
 
 
 def save_media_upload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1435,7 +1590,8 @@ def select_pipeline_draft(draft_id: str, base_url: str) -> Dict[str, Any]:
         return draft
 
 
-def mark_selected_published() -> None:
+def mark_selected_published(url: Any = None) -> None:
+    published_url = safe_web_url(url)
     with DRAFT_LOCK:
         pipeline = ensure_pipeline()
         selected_id = str(pipeline.get("selected_id") or "")
@@ -1445,6 +1601,8 @@ def mark_selected_published() -> None:
                 item["status"] = "published"
                 item["published_at"] = timestamp
                 item["updated_at"] = timestamp
+                if published_url:
+                    item["substack_url"] = published_url
                 break
         write_pipeline(pipeline)
 
@@ -1530,6 +1688,14 @@ def publication_date_matches(item: Dict[str, Any], post: Dict[str, Any], max_day
 
 def substack_feed_url() -> str:
     return os.environ.get("SUBSTACK_FEED_URL") or ""
+
+
+def substack_publication_url() -> str:
+    configured = str(os.environ.get("SUBSTACK_PUBLICATION_URL") or "").strip()
+    parsed = urllib.parse.urlparse(configured or substack_feed_url())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def substack_archive_api_url() -> str:
@@ -2064,31 +2230,254 @@ def ingest_config() -> Dict[str, Any]:
 
 
 def publish_config() -> Dict[str, Any]:
+    publication_url = substack_publication_url()
+    configured = bool(publication_url and browser_cookie3 is not None and requests is not None)
     return {
-        "mode": "api_only",
-        "configured": False,
+        "mode": "background_session_api",
+        "configured": configured,
         "browser_automation": False,
-        "write_api_available": False,
+        "write_api_available": configured,
+        "editor_url": f"{publication_url}/publish/post/new" if publication_url else "",
+        "direct_publish": configured,
         "message": (
-            "Substack's official Developer API and MCP are read-only. "
-            "Browser publishing is disabled, so this dashboard will not claim a Substack publish succeeded."
+            "Background Substack draft and publishing connection is ready. No browser window or tab will be opened."
+            if configured
+            else "Set SUBSTACK_PUBLICATION_URL (or SUBSTACK_FEED_URL) and install the local session dependencies."
         ),
     }
+
+
+def substack_cookie_paths() -> List[Path]:
+    configured = str(os.environ.get("SUBSTACK_CHROME_COOKIE_PATH") or "").strip()
+    paths: List[Path] = [Path(configured).expanduser()] if configured else []
+    chrome_root = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+    paths.extend(sorted(chrome_root.glob("Profile */Cookies")))
+    paths.append(chrome_root / "Default" / "Cookies")
+    unique: List[Path] = []
+    for path in paths:
+        if path.is_file() and path not in unique:
+            unique.append(path)
+    return unique
+
+
+def substack_error_message(response: Any, fallback: str) -> str:
+    try:
+        payload = response.json()
+    except (ValueError, TypeError):
+        payload = {}
+    messages: List[str] = []
+    if isinstance(payload, dict):
+        for error in payload.get("errors") or []:
+            if isinstance(error, dict) and error.get("msg"):
+                messages.append(str(error["msg"]))
+            elif isinstance(error, str):
+                messages.append(error)
+        for key in ("message", "error"):
+            if isinstance(payload.get(key), str):
+                messages.append(str(payload[key]))
+    detail = ". ".join(dict.fromkeys(message.strip() for message in messages if message.strip()))
+    return f"{fallback}: {detail}" if detail else fallback
+
+
+def substack_authenticated_session() -> Tuple[Any, Dict[str, Any]]:
+    if browser_cookie3 is None or requests is None:
+        raise ValueError("The local Substack session connector is not installed.")
+    publication_url = substack_publication_url()
+    if not publication_url:
+        raise ValueError("Set SUBSTACK_PUBLICATION_URL or SUBSTACK_FEED_URL first.")
+    failures: List[str] = []
+    for cookie_path in substack_cookie_paths():
+        try:
+            cookie_jar = browser_cookie3.chrome(cookie_file=str(cookie_path), domain_name="substack.com")
+            if not any(cookie.name == "substack.sid" and cookie.value for cookie in cookie_jar):
+                continue
+            session = requests.Session()
+            session.cookies.update(cookie_jar)
+            session.headers.update(
+                {
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "origin": publication_url,
+                    "referer": f"{publication_url}/publish/post",
+                    "user-agent": SUBSTACK_UA,
+                }
+            )
+            response = session.get("https://substack.com/api/v1/user/profile/self", timeout=30)
+            if response.status_code == 200:
+                profile = response.json()
+                if isinstance(profile, dict) and profile.get("id"):
+                    return session, profile
+            failures.append(substack_error_message(response, f"Profile {cookie_path.parent.name} is not signed in"))
+        except Exception as exc:
+            failures.append(f"{cookie_path.parent.name}: {exc}")
+    detail = failures[-1] if failures else "No signed-in Substack session was found."
+    raise ValueError(f"Sign in to Substack in Chrome once, then retry. {detail}")
+
+
+def substack_request_json(
+    session: Any,
+    method: str,
+    path: str,
+    *,
+    payload: Optional[Dict[str, Any]] = None,
+    fallback: str,
+) -> Dict[str, Any]:
+    url = path if path.startswith("http") else f"{substack_publication_url()}{path}"
+    response = session.request(method, url, json=payload, timeout=45)
+    if response.status_code >= 400:
+        raise ValueError(substack_error_message(response, fallback))
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise ValueError(f"{fallback}: Substack returned an unreadable response.") from exc
+    return data if isinstance(data, dict) else {"data": data}
+
+
+def substack_draft_id(draft: Dict[str, Any]) -> Optional[int]:
+    match = re.search(r"/publish/post/(\d+)", str(draft.get("substack_draft_url") or ""))
+    return int(match.group(1)) if match else None
+
+
+def upload_substack_images(session: Any, draft: Dict[str, Any]) -> Dict[str, str]:
+    ready = publish_ready_draft(draft)
+    uploaded: Dict[str, str] = {}
+    for block in normalize_blocks(ready):
+        if block.get("type") != "image":
+            continue
+        image = str(block.get("url") or "")
+        if not image.startswith("data:image/"):
+            raise ValueError("An article image could not be prepared for Substack; nothing was published.")
+        response = substack_request_json(
+            session,
+            "POST",
+            "/api/v1/image",
+            payload={"image": image},
+            fallback="Substack image upload failed",
+        )
+        image_url = safe_web_url(response.get("url"))
+        if not image_url:
+            raise ValueError("Substack image upload returned no usable URL; nothing was published.")
+        uploaded[str(block.get("id") or "")] = image_url
+    return uploaded
+
+
+def save_substack_draft(session: Any, profile: Dict[str, Any], draft: Dict[str, Any]) -> Dict[str, Any]:
+    publication_url = substack_publication_url()
+    image_urls = upload_substack_images(session, draft)
+    document, cover_url = substack_document(draft, image_urls)
+    payload: Dict[str, Any] = {
+        "type": "newsletter",
+        "draft_title": str(draft.get("title") or "Untitled draft")[:240],
+        "draft_subtitle": str(draft.get("subtitle") or "")[:500],
+        "draft_body": json.dumps(document, ensure_ascii=False, separators=(",", ":")),
+        "draft_bylines": [{"id": profile["id"], "is_guest": False}],
+        "audience": "everyone",
+        "should_send_email": True,
+        "detect_language": True,
+    }
+    if cover_url:
+        payload["cover_image"] = cover_url
+
+    post_id = substack_draft_id(draft)
+    existing: Optional[Dict[str, Any]] = None
+    if post_id:
+        response = session.get(f"{publication_url}/api/v1/drafts/{post_id}", timeout=30)
+        if response.status_code == 200:
+            candidate = response.json()
+            if isinstance(candidate, dict) and not candidate.get("is_published"):
+                existing = candidate
+        elif response.status_code not in {404, 410}:
+            raise ValueError(substack_error_message(response, "Could not open the existing Substack draft"))
+
+    if existing and post_id:
+        if existing.get("draft_updated_at"):
+            payload["last_updated_at"] = existing["draft_updated_at"]
+        saved = substack_request_json(
+            session,
+            "PUT",
+            f"/api/v1/drafts/{post_id}",
+            payload=payload,
+            fallback="Substack draft update failed",
+        )
+    else:
+        saved = substack_request_json(
+            session,
+            "POST",
+            "/api/v1/drafts",
+            payload=payload,
+            fallback="Substack draft creation failed",
+        )
+    saved_id = int(saved.get("id") or post_id or 0)
+    if not saved_id:
+        raise ValueError("Substack saved the draft without returning its ID.")
+    saved["editor_url"] = f"{publication_url}/publish/post/{saved_id}"
+    saved["document"] = document
+    return saved
 
 
 def publish_to_substack(confirm_publish: bool, allow_publish: bool = False) -> Dict[str, Any]:
     draft = current_draft()
     if not draft:
-        raise ValueError("Create a draft from an X article first.")
+        raise ValueError("Create or open a draft first.")
     config = publish_config()
+    if not config["configured"]:
+        raise ValueError(str(config["message"]))
+    if allow_publish and not confirm_publish:
+        raise ValueError("Live publishing requires explicit confirmation.")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PUBLISH_PAYLOAD_JSON.write_text(json.dumps(draft, indent=2), encoding="utf-8")
-    result = {
-        "ok": False,
-        "status": "substack_write_api_unavailable",
-        "message": config["message"],
-        "config": config,
-    }
+    session, profile = substack_authenticated_session()
+    saved = save_substack_draft(session, profile, draft)
+    post_id = int(saved["id"])
+    editor_url = str(saved["editor_url"])
+    remember_substack_draft_url(editor_url)
+    if allow_publish:
+        prepublish = substack_request_json(
+            session,
+            "GET",
+            f"/api/v1/drafts/{post_id}/prepublish",
+            fallback="Substack pre-publish check failed",
+        )
+        errors = prepublish.get("errors") or []
+        if errors:
+            messages = [
+                str(item.get("message") or item.get("msg") or item)
+                if isinstance(item, dict)
+                else str(item)
+                for item in errors
+            ]
+            raise ValueError(f"Substack blocked publishing: {' '.join(messages)}")
+        published = substack_request_json(
+            session,
+            "POST",
+            f"/api/v1/drafts/{post_id}/publish",
+            payload={"send": True},
+            fallback="Substack publish failed",
+        )
+        latest = substack_request_json(
+            session,
+            "GET",
+            f"/api/v1/drafts/{post_id}",
+            fallback="Published post verification failed",
+        )
+        slug = str(latest.get("slug") or published.get("slug") or "").strip()
+        post_url = f"{substack_publication_url()}/p/{slug}" if slug else substack_publication_url()
+        result = {
+            "ok": True,
+            "status": "published",
+            "message": "Published to Substack and sent to subscribers.",
+            "current_url": post_url,
+            "post_url": post_url,
+            "post_id": post_id,
+        }
+    else:
+        result = {
+            "ok": True,
+            "status": "draft_saved",
+            "message": "Saved as a Substack draft in the background.",
+            "current_url": editor_url,
+            "post_id": post_id,
+        }
     PUBLISH_RESULT_JSON.write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
 
@@ -2214,7 +2603,7 @@ class Handler(BaseHTTPRequestHandler):
                     allow_publish=mode == "publish" and confirmed,
                 )
                 if result.get("ok") and result.get("status") == "published":
-                    mark_selected_published()
+                    mark_selected_published(result.get("post_url"))
                 elif result.get("ok") and result.get("current_url"):
                     remember_substack_draft_url(result["current_url"])
                 result["pipeline"] = pipeline_payload()

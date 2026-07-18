@@ -293,13 +293,21 @@ class RichDraftTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in articles], ["1234567890123456790", "1234567890123456789"])
         self.assertEqual(articles[1]["url"], "https://x.com/0xgoodie/status/1234567890123456789")
 
-    def test_substack_publish_connection_is_api_only_and_unavailable(self) -> None:
-        config = server.publish_config()
+    def test_substack_publish_connection_uses_the_background_session_api(self) -> None:
+        previous_publication_url = os.environ.get("SUBSTACK_PUBLICATION_URL")
+        try:
+            os.environ["SUBSTACK_PUBLICATION_URL"] = "https://example.substack.com"
+            config = server.publish_config()
 
-        self.assertEqual(config["mode"], "api_only")
-        self.assertFalse(config["browser_automation"])
-        self.assertFalse(config["write_api_available"])
-        self.assertFalse(config["configured"])
+            self.assertEqual(config["mode"], "background_session_api")
+            self.assertFalse(config["browser_automation"])
+            self.assertTrue(config["write_api_available"])
+            self.assertTrue(config["configured"])
+        finally:
+            if previous_publication_url is None:
+                os.environ.pop("SUBSTACK_PUBLICATION_URL", None)
+            else:
+                os.environ["SUBSTACK_PUBLICATION_URL"] = previous_publication_url
 
     def test_legacy_draft_becomes_ordered_blocks(self) -> None:
         draft = {
@@ -354,6 +362,77 @@ class RichDraftTests(unittest.TestCase):
         self.assertIn("<blockquote><p>Hold the line.</p></blockquote>", rendered)
         self.assertIn('figure data-layout="wide"', rendered)
         self.assertIn("<figcaption>The setup</figcaption>", rendered)
+
+    def test_blocks_become_substack_editor_document_without_flattening_formatting(self) -> None:
+        draft = {
+            "blocks": [
+                {"id": "cover", "type": "image", "url": "https://example.com/cover.png", "layout": "wide"},
+                {"id": "heading", "type": "heading", "html": "Market structure"},
+                {
+                    "id": "copy",
+                    "type": "paragraph",
+                    "html": '<strong>Clear</strong> and <em>patient</em> with <a href="https://example.com/source">evidence</a>.',
+                },
+                {"id": "list", "type": "bullet_list", "items": ["First", "Second"]},
+                {"id": "quote", "type": "pull_quote", "html": "Hold the line."},
+                {"id": "chart", "type": "image", "url": "https://example.com/chart.png", "caption": "The setup"},
+            ]
+        }
+
+        document, cover = server.substack_document(
+            draft,
+            {"cover": "https://substackcdn.com/cover.png", "chart": "https://substackcdn.com/chart.png"},
+        )
+
+        self.assertEqual(cover, "https://substackcdn.com/cover.png")
+        self.assertEqual(
+            [node["type"] for node in document["content"]],
+            ["heading", "paragraph", "bullet_list", "blockquote", "captionedImage"],
+        )
+        paragraph = document["content"][1]
+        self.assertEqual(paragraph["content"][0]["marks"][0]["type"], "strong")
+        self.assertEqual(paragraph["content"][2]["marks"][0]["type"], "em")
+        self.assertEqual(paragraph["content"][4]["marks"][0]["attrs"]["href"], "https://example.com/source")
+        self.assertEqual(document["content"][-1]["content"][0]["attrs"]["src"], "https://substackcdn.com/chart.png")
+
+    def test_substack_draft_save_uses_one_background_create_request(self) -> None:
+        previous_upload = server.upload_substack_images
+        previous_request = server.substack_request_json
+        previous_publication_url = os.environ.get("SUBSTACK_PUBLICATION_URL")
+        calls = []
+        try:
+            os.environ["SUBSTACK_PUBLICATION_URL"] = "https://example.substack.com"
+            server.upload_substack_images = lambda _session, _draft: {}
+
+            def fake_request(session, method, path, *, payload=None, fallback):
+                calls.append({"session": session, "method": method, "path": path, "payload": payload, "fallback": fallback})
+                return {"id": 42, "draft_updated_at": "2026-07-18T10:00:00Z"}
+
+            server.substack_request_json = fake_request
+            saved = server.save_substack_draft(
+                object(),
+                {"id": 7},
+                {
+                    "title": "A clean draft",
+                    "subtitle": "Ready for review",
+                    "blocks": [{"type": "paragraph", "html": "A <strong>formatted</strong> paragraph."}],
+                },
+            )
+
+            self.assertEqual(saved["editor_url"], "https://example.substack.com/publish/post/42")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["method"], "POST")
+            self.assertEqual(calls[0]["path"], "/api/v1/drafts")
+            self.assertEqual(calls[0]["payload"]["draft_bylines"], [{"id": 7, "is_guest": False}])
+            body = json.loads(calls[0]["payload"]["draft_body"])
+            self.assertEqual(body["content"][0]["content"][1]["marks"][0]["type"], "strong")
+        finally:
+            server.upload_substack_images = previous_upload
+            server.substack_request_json = previous_request
+            if previous_publication_url is None:
+                os.environ.pop("SUBSTACK_PUBLICATION_URL", None)
+            else:
+                os.environ["SUBSTACK_PUBLICATION_URL"] = previous_publication_url
 
     def test_x_profile_images_are_not_article_blocks(self) -> None:
         blocks = server.normalize_blocks(
