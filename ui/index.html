@@ -94,13 +94,15 @@
         </div>
         <div class="editor-toolbar" role="toolbar" aria-label="Article formatting">
           <div class="toolbar-group" aria-label="Inline formatting">
-            <button type="button" class="tool-button format-button" data-command="bold" title="Bold" aria-label="Bold"><strong>B</strong></button>
-            <button type="button" class="tool-button format-button" data-command="italic" title="Italic" aria-label="Italic"><em>I</em></button>
-            <button type="button" class="tool-button format-button" data-command="underline" title="Underline" aria-label="Underline"><u>U</u></button>
-            <button type="button" class="tool-button format-button" data-command="strikeThrough" title="Strikethrough" aria-label="Strikethrough"><s>S</s></button>
-            <button id="linkButton" type="button" class="tool-button" title="Add link" aria-label="Add link">Link</button>
+            <button type="button" class="tool-button format-button" data-command="bold" title="Bold (Cmd+B / Ctrl+B)" aria-label="Bold" aria-keyshortcuts="Meta+B Control+B" aria-pressed="false"><strong>B</strong></button>
+            <button type="button" class="tool-button format-button" data-command="italic" title="Italic (Cmd+I / Ctrl+I)" aria-label="Italic" aria-keyshortcuts="Meta+I Control+I" aria-pressed="false"><em>I</em></button>
+            <button type="button" class="tool-button format-button" data-command="underline" title="Underline (Cmd+U / Ctrl+U)" aria-label="Underline" aria-keyshortcuts="Meta+U Control+U" aria-pressed="false"><u>U</u></button>
+            <button type="button" class="tool-button format-button" data-command="strikeThrough" title="Strikethrough (Cmd+Shift+X / Ctrl+Shift+X)" aria-label="Strikethrough" aria-keyshortcuts="Meta+Shift+X Control+Shift+X" aria-pressed="false"><s>S</s></button>
+            <button id="linkButton" type="button" class="tool-button labeled-tool" title="Add link (Cmd+K / Ctrl+K)" aria-label="Add link" aria-keyshortcuts="Meta+K Control+K">Link</button>
           </div>
           <div class="toolbar-group" aria-label="Insert content">
+            <button id="pullQuoteButton" type="button" class="tool-button labeled-tool" title="Insert pull quote">Pull quote</button>
+            <button id="quoteButton" type="button" class="tool-button labeled-tool" title="Insert quote">Quote</button>
             <button id="imageButton" type="button" class="tool-button labeled-tool" title="Insert image">Image</button>
             <button id="embedButton" type="button" class="tool-button labeled-tool" title="Insert media link">Embed</button>
             <button id="dividerButton" type="button" class="tool-button labeled-tool" title="Insert divider">Divider</button>
@@ -112,6 +114,7 @@
             <option value="paragraph">Paragraph</option>
             <option value="heading">Heading</option>
             <option value="subheading">Subheading</option>
+            <option value="pull_quote">Pull quote</option>
             <option value="quote">Quote</option>
             <option value="bullet_list">Bulleted list</option>
             <option value="numbered_list">Numbered list</option>

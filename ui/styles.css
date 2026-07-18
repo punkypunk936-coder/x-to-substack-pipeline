@@ -579,7 +579,8 @@ button:disabled {
 }
 
 .tool-button:hover,
-.tool-button.active {
+.tool-button.active,
+.tool-button[aria-pressed="true"] {
   border-color: var(--line);
   background: #eef2ef;
   color: var(--ink);
@@ -658,6 +659,17 @@ button:disabled {
   padding-left: 18px;
   font-size: 1.17rem;
   font-style: italic;
+}
+
+.editor-block[data-type="pull_quote"] .block-content {
+  margin: 14px 6%;
+  border-top: 1px solid var(--ink);
+  border-bottom: 1px solid var(--ink);
+  padding: 22px 12px;
+  text-align: center;
+  font-size: 1.42rem;
+  font-style: italic;
+  line-height: 1.48;
 }
 
 .editor-block[data-type="code"] .block-content {
@@ -906,6 +918,18 @@ button:disabled {
   padding-left: 19px;
   font-size: 1.16rem;
   font-style: italic;
+}
+
+.preview-body blockquote.pull-quote {
+  margin: 38px 7%;
+  border-top: 1px solid var(--ink);
+  border-right: 0;
+  border-bottom: 1px solid var(--ink);
+  border-left: 0;
+  padding: 24px 14px;
+  text-align: center;
+  font-size: 1.42rem;
+  line-height: 1.48;
 }
 
 .preview-body pre {

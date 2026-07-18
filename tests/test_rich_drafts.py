@@ -306,6 +306,7 @@ class RichDraftTests(unittest.TestCase):
                     {"type": "heading", "html": "Market structure"},
                     {"type": "paragraph", "html": "A <strong>clear</strong> thesis."},
                     {"type": "bullet_list", "items": ["First", "Second"]},
+                    {"type": "pull_quote", "html": "The line worth remembering."},
                     {"type": "quote", "html": "Hold the line."},
                     {"type": "divider"},
                     {
@@ -323,6 +324,7 @@ class RichDraftTests(unittest.TestCase):
 
         self.assertIn("<h2>Market structure</h2>", rendered)
         self.assertIn("<ul><li>First</li><li>Second</li></ul>", rendered)
+        self.assertIn('<blockquote class="pull-quote"><p>The line worth remembering.</p></blockquote>', rendered)
         self.assertIn("<blockquote><p>Hold the line.</p></blockquote>", rendered)
         self.assertIn('figure data-layout="wide"', rendered)
         self.assertIn("<figcaption>The setup</figcaption>", rendered)

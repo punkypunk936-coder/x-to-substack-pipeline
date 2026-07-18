@@ -45,7 +45,7 @@ ENV_FILE = ROOT / ".env"
 DRAFT_LOCK = threading.RLock()
 SYNC_LOCK = threading.Lock()
 
-TEXT_BLOCK_TYPES = {"paragraph", "heading", "subheading", "quote", "code"}
+TEXT_BLOCK_TYPES = {"paragraph", "heading", "subheading", "pull_quote", "quote", "code"}
 LIST_BLOCK_TYPES = {"bullet_list", "numbered_list"}
 MEDIA_BLOCK_TYPES = {"image", "embed"}
 BLOCK_TYPES = TEXT_BLOCK_TYPES | LIST_BLOCK_TYPES | MEDIA_BLOCK_TYPES | {"divider"}
@@ -359,7 +359,7 @@ def blocks_to_markdown(blocks: List[Dict[str, Any]]) -> str:
             chunks.append(f"## {text}")
         elif block_type == "subheading":
             chunks.append(f"### {text}")
-        elif block_type == "quote":
+        elif block_type in {"pull_quote", "quote"}:
             chunks.append("\n".join(f"> {line}" for line in text.splitlines()))
         elif block_type == "code":
             chunks.append(f"```\n{text}\n```")
@@ -391,6 +391,8 @@ def blocks_to_html(blocks: List[Dict[str, Any]]) -> str:
             chunks.append(f"<h2>{content}</h2>")
         elif block_type == "subheading":
             chunks.append(f"<h3>{content}</h3>")
+        elif block_type == "pull_quote":
+            chunks.append(f'<blockquote class="pull-quote"><p>{content}</p></blockquote>')
         elif block_type == "quote":
             chunks.append(f"<blockquote><p>{content}</p></blockquote>")
         elif block_type == "code":
@@ -1219,6 +1221,7 @@ h1 { margin: 0 0 14px; font-size: clamp(2.2rem, 8vw, 4.7rem); line-height: .94; 
 .body h2 { margin: 38px 0 12px; font-size: 1.7rem; line-height: 1.2; }
 .body h3 { margin: 30px 0 10px; font-size: 1.28rem; line-height: 1.25; }
 .body blockquote { margin: 28px 0; border-left: 3px solid var(--ink); padding-left: 20px; font-size: 1.18rem; font-style: italic; }
+.body blockquote.pull-quote { margin: 38px 7%; border-top: 1px solid var(--ink); border-right: 0; border-bottom: 1px solid var(--ink); border-left: 0; padding: 24px 14px; text-align: center; font-size: 1.42rem; line-height: 1.48; }
 .body pre { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; background: #f4f5f2; padding: 16px; font: .92rem/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .body hr { margin: 34px auto; width: 88px; border: 0; border-top: 1px solid var(--line); }
 .body figure[data-layout="wide"] { margin-left: max(-8vw, -80px); margin-right: max(-8vw, -80px); }

@@ -1,11 +1,12 @@
 const $ = (selector) => document.querySelector(selector);
 
-const TEXT_BLOCK_TYPES = new Set(["paragraph", "heading", "subheading", "quote", "code"]);
+const TEXT_BLOCK_TYPES = new Set(["paragraph", "heading", "subheading", "pull_quote", "quote", "code"]);
 const LIST_BLOCK_TYPES = new Set(["bullet_list", "numbered_list"]);
 const BLOCK_LABELS = {
   paragraph: "Paragraph",
   heading: "Heading",
   subheading: "Subheading",
+  pull_quote: "Pull quote",
   quote: "Quote",
   bullet_list: "Bulleted list",
   numbered_list: "Numbered list",
@@ -169,6 +170,7 @@ function blocksHtml(blocks) {
     if (block.type === "paragraph") return `<p>${sanitizeInline(block.html) || "<br>"}</p>`;
     if (block.type === "heading") return `<h2>${sanitizeInline(block.html)}</h2>`;
     if (block.type === "subheading") return `<h3>${sanitizeInline(block.html)}</h3>`;
+    if (block.type === "pull_quote") return `<blockquote class="pull-quote"><p>${sanitizeInline(block.html)}</p></blockquote>`;
     if (block.type === "quote") return `<blockquote><p>${sanitizeInline(block.html)}</p></blockquote>`;
     if (block.type === "code") return `<pre><code>${escapeHtml(plainText(block.html))}</code></pre>`;
     if (LIST_BLOCK_TYPES.has(block.type)) {
@@ -369,6 +371,7 @@ function listContentNode(block) {
     item.dataset.placeholder = "List item";
     item.innerHTML = sanitizeInline(value);
     item.addEventListener("keydown", (event) => {
+      if (handleFormattingShortcut(event)) return;
       if (event.key === "Enter") {
         event.preventDefault();
         const selection = window.getSelection();
@@ -507,6 +510,7 @@ function focusBlock(id, atEnd = false) {
 }
 
 function handleTextKeydown(event, block, content) {
+  if (handleFormattingShortcut(event)) return;
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
     const selection = window.getSelection();
@@ -887,7 +891,48 @@ function applyInlineCommand(command) {
   } else {
     document.execCommand(command, false);
   }
-  editable.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "formatBold" }));
+  const inputTypes = {
+    bold: "formatBold",
+    italic: "formatItalic",
+    underline: "formatUnderline",
+    strikeThrough: "formatStrikeThrough",
+    createLink: "insertLink",
+  };
+  editable.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: inputTypes[command] || "formatSetBlockTextDirection" }));
+  updateFormattingState();
+}
+
+function handleFormattingShortcut(event) {
+  if (!(event.metaKey || event.ctrlKey) || event.altKey) return false;
+  const key = event.key.toLowerCase();
+  let command = null;
+  if (!event.shiftKey && key === "b") command = "bold";
+  else if (!event.shiftKey && key === "i") command = "italic";
+  else if (!event.shiftKey && key === "u") command = "underline";
+  else if (!event.shiftKey && key === "k") command = "createLink";
+  else if (event.shiftKey && key === "x") command = "strikeThrough";
+  if (!command) return false;
+  event.preventDefault();
+  applyInlineCommand(command);
+  return true;
+}
+
+function updateFormattingState() {
+  const selection = window.getSelection();
+  const anchor = selection?.anchorNode;
+  const anchorElement = anchor?.nodeType === Node.ELEMENT_NODE ? anchor : anchor?.parentElement;
+  const editable = anchorElement?.closest?.("[contenteditable='true']");
+  const insideEditor = Boolean(editable && $("#blockEditor").contains(editable));
+  document.querySelectorAll(".format-button").forEach((button) => {
+    let active = false;
+    if (insideEditor) {
+      try {
+        active = document.queryCommandState(button.dataset.command);
+      } catch {}
+    }
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
 }
 
 async function copyRichDraft(showStatus = true) {
@@ -1005,6 +1050,8 @@ $("#editor").addEventListener("submit", async (event) => {
   }
 });
 $("#addBlockButton").addEventListener("click", () => insertBlock(normalizeBlock({ id: uid(), type: $("#blockTypeSelect").value })));
+$("#pullQuoteButton").addEventListener("click", () => insertBlock({ id: uid(), type: "pull_quote" }));
+$("#quoteButton").addEventListener("click", () => insertBlock({ id: uid(), type: "quote" }));
 $("#dividerButton").addEventListener("click", () => insertBlock({ id: uid(), type: "divider" }));
 $("#imageButton").addEventListener("click", () => openMediaDialog());
 $("#embedButton").addEventListener("click", addEmbed);
@@ -1015,6 +1062,7 @@ document.querySelectorAll(".format-button").forEach((button) => {
     applyInlineCommand(button.dataset.command);
   });
 });
+document.addEventListener("selectionchange", updateFormattingState);
 $("#mediaForm").addEventListener("submit", submitMedia);
 $("#mediaFile").addEventListener("change", () => {
   const file = $("#mediaFile").files[0];
