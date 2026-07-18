@@ -1109,6 +1109,22 @@ button:disabled {
   margin-top: 22px;
 }
 
+.conflict-dialog {
+  width: min(560px, calc(100% - 28px));
+}
+
+.conflict-message {
+  margin: 4px 0 22px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.conflict-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 .visually-hidden {
   position: absolute;
   width: 1px;

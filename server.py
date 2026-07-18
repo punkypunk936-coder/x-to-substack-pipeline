@@ -7,6 +7,7 @@ import csv
 import datetime as dt
 import difflib
 import email.utils
+import hashlib
 import html
 import json
 import mimetypes
@@ -39,6 +40,8 @@ PUBLISH_PAYLOAD_JSON = DATA_DIR / "publish_payload.json"
 PUBLISH_RESULT_JSON = DATA_DIR / "publish_result.json"
 DRAFT_PIPELINE_JSON = DATA_DIR / "draft_pipeline.json"
 SYNC_STATE_JSON = DATA_DIR / "sync_state.json"
+SUBSTACK_MEDIA_CACHE_JSON = DATA_DIR / "substack_media_cache.json"
+PUBLISH_ATTEMPT_DIR = DATA_DIR / "publish_attempts"
 MEDIA_DIR = DATA_DIR / "media"
 PIPELINE_BACKUP_DIR = DATA_DIR / "backups"
 EDITOR_BACKUP_DIR = PIPELINE_BACKUP_DIR / "editor"
@@ -68,6 +71,13 @@ SUBSTACK_UA = (
 )
 FXTWITTER_API_BASE = "https://api.fxtwitter.com"
 RICH_EXTRACTION_VERSION = "x_draftjs_api_v1"
+STATE_SCHEMA_VERSION = 2
+PUBLIC_VERIFY_TIMEOUT_SECONDS = 35
+UNVERIFIED_SUBSTACK_STATES = {"draft_saving", "draft_unverified", "draft_verified", "publish_unverified"}
+
+
+class SubstackConflictError(ValueError):
+    pass
 
 
 try:
@@ -98,6 +108,30 @@ def load_env_file() -> None:
 
 
 load_env_file()
+
+
+def atomic_write_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def write_json_atomic(path: Path, payload: Any) -> None:
+    atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def read_json_file(path: Path, default: Any = None) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return default
 
 
 def ssl_context() -> ssl.SSLContext:
@@ -250,11 +284,15 @@ def block_id(value: Any = None) -> str:
     return candidate or uuid.uuid4().hex[:12]
 
 
-def normalize_block(raw: Any) -> Optional[Dict[str, Any]]:
+def normalize_block(raw: Any, *, strict: bool = False) -> Optional[Dict[str, Any]]:
     if not isinstance(raw, dict):
+        if strict:
+            raise ValueError("Draft contains an invalid editor block.")
         return None
     block_type = str(raw.get("type") or "paragraph")
     if block_type not in BLOCK_TYPES:
+        if strict:
+            raise ValueError(f"Draft contains an unsupported editor block: {block_type}.")
         block_type = "paragraph"
     block: Dict[str, Any] = {"id": block_id(raw.get("id")), "type": block_type}
     if block_type in TEXT_BLOCK_TYPES:
@@ -270,6 +308,8 @@ def normalize_block(raw: Any) -> Optional[Dict[str, Any]]:
     elif block_type == "image":
         image_url = safe_web_url(raw.get("url"), allow_local_media=True)
         if re.search(r"/(profile_images|profile_banners|emoji)/", image_url, re.I):
+            if strict:
+                raise ValueError("Profile and avatar images cannot be inserted as article media.")
             return None
         block.update(
             {
@@ -280,10 +320,14 @@ def normalize_block(raw: Any) -> Optional[Dict[str, Any]]:
             }
         )
         if not block["url"]:
+            if strict:
+                raise ValueError("An image block is missing its image URL.")
             return None
     elif block_type == "embed":
         url = safe_web_url(raw.get("url"))
         if not url:
+            if strict:
+                raise ValueError("An embed block is missing a valid URL.")
             return None
         block.update({"url": url, "caption": clean_text(str(raw.get("caption") or ""))[:500]})
     return block
@@ -388,12 +432,80 @@ def legacy_blocks(draft: Dict[str, Any]) -> List[Dict[str, Any]]:
     return blocks or [{"id": block_id(), "type": "paragraph", "html": ""}]
 
 
-def normalize_blocks(draft: Dict[str, Any]) -> List[Dict[str, Any]]:
+def normalize_blocks(draft: Dict[str, Any], *, strict: bool = False) -> List[Dict[str, Any]]:
     raw_blocks = draft.get("blocks")
     if not isinstance(raw_blocks, list):
         return legacy_blocks(draft)
-    blocks = [block for raw in raw_blocks if (block := normalize_block(raw)) is not None]
+    blocks = [block for raw in raw_blocks if (block := normalize_block(raw, strict=strict)) is not None]
+    if strict and not blocks:
+        raise ValueError("Draft body cannot be empty.")
     return blocks or [{"id": block_id(), "type": "paragraph", "html": ""}]
+
+
+def canonical_block(block: Dict[str, Any]) -> Dict[str, Any]:
+    block_type = str(block.get("type") or "paragraph")
+    result: Dict[str, Any] = {"type": block_type}
+    if block_type in TEXT_BLOCK_TYPES:
+        result["html"] = sanitize_inline_html(block.get("html") or "")
+    elif block_type in LIST_BLOCK_TYPES:
+        result["items"] = [sanitize_inline_html(item) for item in block.get("items") or []]
+    elif block_type == "image":
+        result.update(
+            {
+                "url": str(block.get("url") or ""),
+                "alt": str(block.get("alt") or ""),
+                "caption": str(block.get("caption") or ""),
+                "layout": str(block.get("layout") or "regular"),
+            }
+        )
+    elif block_type == "embed":
+        result.update({"url": str(block.get("url") or ""), "caption": str(block.get("caption") or "")})
+    return result
+
+
+def canonical_draft_content(draft: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "title": str(draft.get("title") or "").strip(),
+        "subtitle": str(draft.get("subtitle") or "").strip(),
+        "blocks": [canonical_block(block) for block in normalize_blocks(draft)],
+    }
+
+
+def content_hash(payload: Any) -> str:
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def draft_content_hash(draft: Dict[str, Any]) -> str:
+    return content_hash(canonical_draft_content(draft))
+
+
+def stamp_draft_state(
+    draft: Dict[str, Any],
+    *,
+    imported_snapshot: bool = False,
+    local_edit: bool = False,
+) -> Dict[str, Any]:
+    draft["state_schema_version"] = STATE_SCHEMA_VERSION
+    current_hash = draft_content_hash(draft)
+    draft["local_content_hash"] = current_hash
+    if imported_snapshot and str(draft.get("source") or "") != "original":
+        draft["source_content_hash"] = current_hash
+        draft["source_captured_at"] = now_iso()
+        draft["user_modified"] = False
+    elif str(draft.get("source") or "") == "original":
+        draft.setdefault("source_content_hash", None)
+        draft["user_modified"] = bool(local_edit or draft.get("user_modified"))
+    else:
+        source_hash = str(draft.get("source_content_hash") or current_hash)
+        draft["source_content_hash"] = source_hash
+        draft["user_modified"] = bool(local_edit or current_hash != source_hash or draft.get("user_modified"))
+    if local_edit:
+        draft["last_local_edit_at"] = now_iso()
+        draft["local_revision"] = int(draft.get("local_revision") or 0) + 1
+    else:
+        draft.setdefault("local_revision", 0)
+    return draft
 
 
 def block_plain_text(block: Dict[str, Any]) -> str:
@@ -1047,6 +1159,8 @@ def draftjs_blocks(article: Dict[str, Any]) -> List[Dict[str, Any]]:
         raw_type = str(raw.get("type") or "unstyled")
         text = str(raw.get("text") or "")
         if raw_type in {"unordered-list-item", "ordered-list-item"}:
+            if int(raw.get("depth") or 0) != 0:
+                raise ValueError("Nested X Article lists are not supported exactly yet, so no flattened draft was created.")
             list_type = "bullet_list" if raw_type == "unordered-list-item" else "numbered_list"
             if pending_list_type and pending_list_type != list_type:
                 flush_list()
@@ -1398,6 +1512,7 @@ def persist_draft(draft: Dict[str, Any], base_url: str) -> Dict[str, Any]:
     draft = dict(draft)
     draft["blocks"] = normalize_blocks(draft)
     draft["body"] = blocks_plain_text(draft["blocks"])
+    stamp_draft_state(draft)
     if not is_draft_usable(draft):
         raise ValueError("Refusing to save an empty/byline-only draft. Capture the full X article first.")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1432,7 +1547,7 @@ def persist_draft(draft: Dict[str, Any], base_url: str) -> Dict[str, Any]:
     draft["markdown_path"] = str(md_path)
     draft["draft_url"] = base_url.rstrip("/") + "/draft.html"
     draft["feed_url"] = base_url.rstrip("/") + "/feed.xml"
-    CURRENT_JSON.write_text(json.dumps(draft, indent=2), encoding="utf-8")
+    write_json_atomic(CURRENT_JSON, draft)
 
     write_style()
     (DIST_DIR / "draft.html").write_text(render_article_html(draft), encoding="utf-8")
@@ -1455,9 +1570,12 @@ def persist_draft(draft: Dict[str, Any], base_url: str) -> Dict[str, Any]:
 def current_draft() -> Optional[Dict[str, Any]]:
     if not CURRENT_JSON.exists():
         return None
-    draft = json.loads(CURRENT_JSON.read_text(encoding="utf-8"))
+    draft = read_json_file(CURRENT_JSON)
+    if not isinstance(draft, dict):
+        return None
     draft["blocks"] = normalize_blocks(draft)
     draft["body"] = blocks_plain_text(draft["blocks"])
+    stamp_draft_state(draft)
     return draft if is_draft_usable(draft) else None
 
 
@@ -1466,7 +1584,7 @@ def archive_editor_revision(draft: Dict[str, Any]) -> None:
     draft_id = block_id(draft.get("id") or pipeline_draft_id(draft))
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     path = EDITOR_BACKUP_DIR / f"{draft_id}-{timestamp}.json"
-    path.write_text(json.dumps(draft, indent=2, ensure_ascii=False), encoding="utf-8")
+    write_json_atomic(path, draft)
     revisions = sorted(EDITOR_BACKUP_DIR.glob(f"{draft_id}-*.json"), key=lambda item: item.stat().st_mtime, reverse=True)
     for old_revision in revisions[50:]:
         old_revision.unlink(missing_ok=True)
@@ -1479,7 +1597,7 @@ def save_dashboard_draft(payload: Dict[str, Any], base_url: str) -> Dict[str, An
     title = str(payload.get("title") or "").strip()
     if not isinstance(payload.get("blocks"), list):
         raise ValueError("Draft blocks are required.")
-    blocks = normalize_blocks({"blocks": payload["blocks"]})
+    blocks = normalize_blocks({"blocks": payload["blocks"]}, strict=True)
     body = blocks_plain_text(blocks)
     if not title:
         raise ValueError("Draft title cannot be empty.")
@@ -1504,9 +1622,10 @@ def save_dashboard_draft(payload: Dict[str, Any], base_url: str) -> Dict[str, An
         sort_keys=True,
         ensure_ascii=False,
     )
-    if previous_state != next_state:
+    changed = previous_state != next_state
+    if changed:
         archive_editor_revision(draft)
-    return upsert_pipeline_draft(updated, base_url, select=True)
+    return upsert_pipeline_draft(updated, base_url, select=True, local_edit=changed)
 
 
 def now_iso() -> str:
@@ -1548,9 +1667,8 @@ def read_pipeline() -> Dict[str, Any]:
     with DRAFT_LOCK:
         if not DRAFT_PIPELINE_JSON.exists():
             return empty_pipeline()
-        try:
-            pipeline = json.loads(DRAFT_PIPELINE_JSON.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        pipeline = read_json_file(DRAFT_PIPELINE_JSON)
+        if not isinstance(pipeline, dict):
             return empty_pipeline()
         if not isinstance(pipeline.get("items"), list):
             pipeline["items"] = []
@@ -1558,8 +1676,7 @@ def read_pipeline() -> Dict[str, Any]:
 
 
 def write_pipeline(pipeline: Dict[str, Any]) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    DRAFT_PIPELINE_JSON.write_text(json.dumps(pipeline, indent=2), encoding="utf-8")
+    write_json_atomic(DRAFT_PIPELINE_JSON, pipeline)
 
 
 def ensure_pipeline() -> Dict[str, Any]:
@@ -1572,6 +1689,7 @@ def ensure_pipeline() -> Dict[str, Any]:
             return pipeline
         timestamp = now_iso()
         item = dict(draft)
+        stamp_draft_state(item, imported_snapshot=str(item.get("source") or "") != "original")
         item.update(
             {
                 "id": pipeline_draft_id(draft),
@@ -1591,18 +1709,35 @@ def upsert_pipeline_draft(
     base_url: str,
     *,
     select: bool,
+    source_snapshot: bool = False,
+    local_edit: bool = False,
 ) -> Dict[str, Any]:
     with DRAFT_LOCK:
         pipeline = ensure_pipeline()
         draft = dict(draft)
         draft_id = pipeline_draft_id(draft)
         existing = next((item for item in pipeline["items"] if str(item.get("id")) == draft_id), None)
-        if existing is not None:
+        protected_local_edit = bool(existing is not None and source_snapshot and bool(existing.get("user_modified")))
+        if protected_local_edit:
+            incoming = dict(draft)
+            incoming["blocks"] = normalize_blocks(incoming)
+            incoming["body"] = blocks_plain_text(incoming["blocks"])
+            incoming_hash = draft_content_hash(incoming)
+            merged = dict(existing)
+            for key in ("extraction_version", "fidelity", "warnings", "source"):
+                if key in incoming:
+                    merged[key] = incoming[key]
+            merged["latest_source_content_hash"] = incoming_hash
+            merged["latest_source_captured_at"] = now_iso()
+            merged["source_changed_since_edit"] = incoming_hash != str(existing.get("source_content_hash") or "")
+            draft = merged
+        elif existing is not None:
             merged = dict(existing)
             merged.update(draft)
             draft = merged
         draft["blocks"] = normalize_blocks(draft)
         draft["body"] = blocks_plain_text(draft["blocks"])
+        stamp_draft_state(draft, imported_snapshot=source_snapshot and not protected_local_edit, local_edit=local_edit)
         timestamp = now_iso()
         draft.update(
             {
@@ -1638,11 +1773,11 @@ def select_pipeline_draft(draft_id: str, base_url: str) -> Dict[str, Any]:
         return draft
 
 
-def mark_selected_published(url: Any = None) -> None:
+def mark_selected_published(url: Any = None, draft_id: Any = None) -> None:
     published_url = safe_web_url(url)
     with DRAFT_LOCK:
         pipeline = ensure_pipeline()
-        selected_id = str(pipeline.get("selected_id") or "")
+        selected_id = str(draft_id or pipeline.get("selected_id") or "")
         timestamp = now_iso()
         for item in pipeline["items"]:
             if str(item.get("id")) == selected_id:
@@ -1652,7 +1787,26 @@ def mark_selected_published(url: Any = None) -> None:
                 if published_url:
                     item["substack_url"] = published_url
                 break
+        if str(pipeline.get("selected_id") or "") == selected_id:
+            active = [item for item in pipeline["items"] if item.get("status") != "published"]
+            next_selected = max(
+                active,
+                key=lambda item: (
+                    int(str(item.get("id") or "0")) if str(item.get("id") or "").isdigit() else 0,
+                    str(item.get("discovered_at") or ""),
+                ),
+                default=None,
+            )
+            pipeline["selected_id"] = next_selected.get("id") if next_selected else None
         write_pipeline(pipeline)
+        current = current_draft()
+        if current and str(current.get("id") or "") == selected_id:
+            current["status"] = "published"
+            current["published_at"] = timestamp
+            current["updated_at"] = timestamp
+            if published_url:
+                current["substack_url"] = published_url
+            write_json_atomic(CURRENT_JSON, current)
 
 
 def remember_substack_draft_url(url: Any) -> None:
@@ -1667,7 +1821,7 @@ def remember_substack_draft_url(url: Any) -> None:
         if not draft:
             return
         draft["substack_draft_url"] = draft_url
-        CURRENT_JSON.write_text(json.dumps(draft, indent=2), encoding="utf-8")
+        write_json_atomic(CURRENT_JSON, draft)
         pipeline = ensure_pipeline()
         selected_id = str(pipeline.get("selected_id") or "")
         for item in pipeline["items"]:
@@ -1681,15 +1835,12 @@ def remember_substack_draft_url(url: Any) -> None:
 def sync_state() -> Dict[str, Any]:
     if not SYNC_STATE_JSON.exists():
         return {"status": "idle", "last_sync": None, "last_error": None}
-    try:
-        return json.loads(SYNC_STATE_JSON.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {"status": "idle", "last_sync": None, "last_error": None}
+    state = read_json_file(SYNC_STATE_JSON)
+    return state if isinstance(state, dict) else {"status": "idle", "last_sync": None, "last_error": None}
 
 
 def write_sync_state(state: Dict[str, Any]) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    SYNC_STATE_JSON.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    write_json_atomic(SYNC_STATE_JSON, state)
 
 
 def normalized_title(value: Any) -> str:
@@ -1732,6 +1883,25 @@ def publication_date_matches(item: Dict[str, Any], post: Dict[str, Any], max_day
     except ValueError:
         return True
     return abs((left - right).days) <= max_days
+
+
+def normalized_public_url(value: Any) -> str:
+    url = safe_web_url(value)
+    return url.split("?", 1)[0].rstrip("/") if url else ""
+
+
+def normalized_link_url(value: Any) -> str:
+    url = safe_web_url(value, allow_mailto=True)
+    return html.unescape(url).rstrip("/") if url else ""
+
+
+def item_substack_post_id(item: Dict[str, Any]) -> Optional[int]:
+    raw = item.get("substack_post_id")
+    if isinstance(raw, int) and raw > 0:
+        return raw
+    if isinstance(raw, str) and raw.isdigit():
+        return int(raw)
+    return substack_draft_id(item)
 
 
 def substack_feed_url() -> str:
@@ -1802,6 +1972,9 @@ def fetch_substack_archive_publications() -> List[Dict[str, Any]]:
             continue
         publications.append(
             {
+                "post_id": int(post.get("id") or 0) or None,
+                "uuid": str(post.get("uuid") or "") or None,
+                "slug": str(post.get("slug") or "") or None,
                 "title": title,
                 "url": url,
                 "published_at": published_at,
@@ -1819,8 +1992,10 @@ def merge_substack_publications(*sources: List[Dict[str, Any]]) -> List[Dict[str
             if not url:
                 continue
             existing = merged.get(url)
-            if existing is None or post.get("source") == "archive_api":
+            if existing is None:
                 merged[url] = dict(post)
+            elif post.get("source") == "archive_api":
+                merged[url] = {**existing, **post}
     return sorted(
         merged.values(),
         key=lambda post: str(post.get("published_at") or ""),
@@ -1859,8 +2034,38 @@ def reconcile_substack_publications() -> Dict[str, Any]:
 
         for item in pipeline["items"]:
             item_id = str(item.get("id") or "")
+            if not item_id:
+                continue
+            if str(item.get("substack_sync_state") or "") in UNVERIFIED_SUBSTACK_STATES:
+                continue
+            known_url = normalized_public_url(item.get("substack_url"))
+            known_post_id = item_substack_post_id(item)
+            exact_index = next(
+                (
+                    index
+                    for index in unmatched_posts
+                    if (known_url and normalized_public_url(publications[index].get("url")) == known_url)
+                    or (
+                        known_post_id
+                        and int(publications[index].get("post_id") or 0) == known_post_id
+                    )
+                ),
+                None,
+            )
+            if exact_index is None:
+                continue
+            method = "post_id" if known_post_id and int(publications[exact_index].get("post_id") or 0) == known_post_id else "public_url"
+            matches[item_id] = (publications[exact_index], 1.0, method)
+            unmatched_posts.remove(exact_index)
+
+        for item in pipeline["items"]:
+            item_id = str(item.get("id") or "")
             item_title = normalized_title(item.get("title"))
-            if not item_id or not item_title:
+            if not item_id or not item_title or item_id in matches:
+                continue
+            if str(item.get("substack_sync_state") or "") in UNVERIFIED_SUBSTACK_STATES:
+                continue
+            if item.get("substack_url") or item_substack_post_id(item):
                 continue
             exact_candidates = [
                 index
@@ -1876,7 +2081,9 @@ def reconcile_substack_publications() -> Dict[str, Any]:
 
         for item in pipeline["items"]:
             item_id = str(item.get("id") or "")
-            if not item_id or item_id in matches:
+            if not item_id or item_id in matches or item.get("substack_url") or item_substack_post_id(item):
+                continue
+            if str(item.get("substack_sync_state") or "") in UNVERIFIED_SUBSTACK_STATES:
                 continue
             candidates: List[Tuple[float, int]] = []
             for index in unmatched_posts:
@@ -1923,6 +2130,12 @@ def reconcile_substack_publications() -> Dict[str, Any]:
             ):
                 item["status"] = "published"
                 item["substack_url"] = post["url"]
+                if post.get("post_id"):
+                    item["substack_post_id"] = post["post_id"]
+                if post.get("uuid"):
+                    item["substack_uuid"] = post["uuid"]
+                if post.get("slug"):
+                    item["substack_slug"] = post["slug"]
                 item["published_at"] = next_published_at
                 item["updated_at"] = now_iso()
                 updated.append(draft_id)
@@ -1980,6 +2193,9 @@ def pipeline_payload() -> Dict[str, Any]:
                 "updated_at": item.get("updated_at"),
                 "published_at": item.get("published_at"),
                 "substack_url": item.get("substack_url"),
+                "substack_sync_state": item.get("substack_sync_state"),
+                "substack_last_error": item.get("substack_last_error"),
+                "user_modified": bool(item.get("user_modified")),
             }
             for item in items
         ],
@@ -2005,7 +2221,7 @@ def selected_pipeline_draft() -> Optional[Dict[str, Any]]:
 
 
 def bootstrap_payload() -> Dict[str, Any]:
-    last_publish = json.loads(PUBLISH_RESULT_JSON.read_text(encoding="utf-8")) if PUBLISH_RESULT_JSON.exists() else None
+    last_publish = read_json_file(PUBLISH_RESULT_JSON)
     with DRAFT_LOCK:
         return {
             "draft": selected_pipeline_draft(),
@@ -2131,6 +2347,11 @@ def backfill_pipeline_drafts(
     fetch = fetcher or build_draft
     snapshot = read_pipeline()
     selected_id = str(snapshot.get("selected_id") or "")
+    protected = [
+        dict(item)
+        for item in snapshot.get("items", [])
+        if isinstance(item, dict) and bool(item.get("user_modified"))
+    ]
     candidates = [
         dict(item)
         for item in snapshot.get("items", [])
@@ -2138,10 +2359,16 @@ def backfill_pipeline_drafts(
             isinstance(item, dict)
             and extract_x_id(str(item.get("url") or ""))
             and str(item.get("extraction_version") or "") != RICH_EXTRACTION_VERSION
+            and not bool(item.get("user_modified"))
         )
     ]
     upgraded: List[str] = []
-    skipped: List[Dict[str, str]] = []
+    skipped: List[Dict[str, str]] = [
+        {"id": str(item.get("id") or ""), "error": "Kept dashboard edits; source backfill was not allowed to overwrite them."}
+        for item in protected
+        if extract_x_id(str(item.get("url") or ""))
+        and str(item.get("extraction_version") or "") != RICH_EXTRACTION_VERSION
+    ]
     backup_path = ""
     for existing in candidates:
         draft_id = str(existing.get("id") or "")
@@ -2161,9 +2388,9 @@ def backfill_pipeline_drafts(
                 PIPELINE_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
                 backup = PIPELINE_BACKUP_DIR / f"draft_pipeline-before-{RICH_EXTRACTION_VERSION}.json"
                 if not backup.exists():
-                    backup.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+                    write_json_atomic(backup, snapshot)
                 backup_path = str(backup)
-            upsert_pipeline_draft(replacement, base_url, select=False)
+            upsert_pipeline_draft(replacement, base_url, select=False, source_snapshot=True)
             upgraded.append(draft_id)
         except Exception as exc:
             skipped.append({"id": draft_id, "error": str(exc)})
@@ -2176,6 +2403,62 @@ def backfill_pipeline_drafts(
     }
 
 
+def audit_pipeline_source_hashes(fetcher: Optional[Any] = None) -> Dict[str, Any]:
+    fetch = fetcher or build_draft
+    snapshot = read_pipeline()
+    candidates = [
+        dict(item)
+        for item in snapshot.get("items", [])
+        if isinstance(item, dict)
+        and extract_x_id(str(item.get("url") or ""))
+        and not item.get("source_content_hash")
+    ]
+    audited: List[str] = []
+    protected: List[str] = []
+    errors: List[Dict[str, str]] = []
+    source_states: Dict[str, Dict[str, Any]] = {}
+    for item in candidates:
+        draft_id = str(item.get("id") or "")
+        try:
+            source = fetch(str(item.get("url") or ""))
+            if not isinstance(source, dict) or pipeline_draft_id(source) != draft_id:
+                raise ValueError("Fresh X source did not match the pipeline record.")
+            if title_match_score(item.get("title"), source.get("title")) < 0.95:
+                raise ValueError("Fresh X title did not match the pipeline record.")
+            source_hash = draft_content_hash(source)
+            local_hash = draft_content_hash(item)
+            modified = source_hash != local_hash
+            source_states[draft_id] = {
+                "state_schema_version": STATE_SCHEMA_VERSION,
+                "source_content_hash": source_hash,
+                "source_captured_at": now_iso(),
+                "local_content_hash": local_hash,
+                "user_modified": modified,
+                "local_revision": int(item.get("local_revision") or 0),
+            }
+            audited.append(draft_id)
+            if modified:
+                protected.append(draft_id)
+        except Exception as exc:
+            errors.append({"id": draft_id, "error": str(exc)})
+
+    if source_states:
+        with DRAFT_LOCK:
+            pipeline = read_pipeline()
+            for item in pipeline.get("items", []):
+                state = source_states.get(str(item.get("id") or ""))
+                if state:
+                    item.update(state)
+            write_pipeline(pipeline)
+            current = read_json_file(CURRENT_JSON)
+            if isinstance(current, dict):
+                state = source_states.get(str(current.get("id") or pipeline_draft_id(current)))
+                if state:
+                    current.update(state)
+                    write_json_atomic(CURRENT_JSON, current)
+    return {"audited": audited, "protected": protected, "errors": errors}
+
+
 def sync_x_articles(base_url: str) -> Dict[str, Any]:
     if not SYNC_LOCK.acquire(blocking=False):
         return {"ok": True, "status": "already_syncing", "pipeline": pipeline_payload()}
@@ -2185,6 +2468,8 @@ def sync_x_articles(base_url: str) -> Dict[str, Any]:
         discovered: List[Dict[str, Any]] = []
         added: List[str] = []
         upgraded: List[str] = []
+        source_audited: List[str] = []
+        source_protected: List[str] = []
         errors: List[str] = []
         x_ok = False
         substack_ok = False
@@ -2205,7 +2490,7 @@ def sync_x_articles(base_url: str) -> Dict[str, Any]:
                 draft = build_draft(url)
                 if found.get("title") and len(str(found["title"]).strip()) >= 8:
                     draft["title"] = str(found["title"]).strip()[:240]
-                upsert_pipeline_draft(draft, base_url, select=False)
+                upsert_pipeline_draft(draft, base_url, select=False, source_snapshot=True)
                 existing_ids.add(draft_id)
                 added.append(draft_id)
             except Exception as exc:
@@ -2217,6 +2502,14 @@ def sync_x_articles(base_url: str) -> Dict[str, Any]:
                 errors.append(f"Rich backfill {skipped.get('id')}: {skipped.get('error')}")
         except Exception as exc:
             errors.append(f"Rich backfill: {exc}")
+        try:
+            source_audit = audit_pipeline_source_hashes()
+            source_audited = list(source_audit.get("audited") or [])
+            source_protected = list(source_audit.get("protected") or [])
+            for issue in source_audit.get("errors") or []:
+                errors.append(f"Source audit {issue.get('id')}: {issue.get('error')}")
+        except Exception as exc:
+            errors.append(f"Source audit: {exc}")
         try:
             reconciliation = reconcile_substack_publications()
             substack_ok = True
@@ -2231,6 +2524,8 @@ def sync_x_articles(base_url: str) -> Dict[str, Any]:
             "discovered_count": len(discovered),
             "added_count": len(added),
             "upgraded_count": len(upgraded),
+            "source_audited_count": len(source_audited),
+            "source_protected_count": len(source_protected),
             "substack_publication_count": reconciliation.get("publication_count", 0),
             "published_match_count": len(reconciliation.get("matched", [])),
             "substack_feed_url": reconciliation.get("feed_url") or substack_feed_url(),
@@ -2241,6 +2536,8 @@ def sync_x_articles(base_url: str) -> Dict[str, Any]:
             "status": state["status"],
             "added": added,
             "upgraded": upgraded,
+            "source_audited": source_audited,
+            "source_protected": source_protected,
             "published_matches": reconciliation.get("matched", []),
             "newly_published": reconciliation.get("updated", []),
             "publication_match_details": reconciliation.get("match_details", []),
@@ -2382,19 +2679,251 @@ def substack_request_json(
 
 
 def substack_draft_id(draft: Dict[str, Any]) -> Optional[int]:
+    raw = draft.get("substack_post_id")
+    if isinstance(raw, int) and raw > 0:
+        return raw
+    if isinstance(raw, str) and raw.isdigit():
+        return int(raw)
     match = re.search(r"/publish/post/(\d+)", str(draft.get("substack_draft_url") or ""))
     return int(match.group(1)) if match else None
 
 
+def prosemirror_document(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        document = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            document = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Substack returned an unreadable editor document.") from exc
+    else:
+        raise ValueError("Substack returned no editor document.")
+    if not isinstance(document, dict) or document.get("type") != "doc" or not isinstance(document.get("content"), list):
+        raise ValueError("Substack returned an invalid editor document.")
+    return document
+
+
+def remote_substack_document(post: Dict[str, Any]) -> Dict[str, Any]:
+    for key in ("draft_body", "body"):
+        value = post.get(key)
+        if value:
+            return prosemirror_document(value)
+    raise ValueError("Substack returned no saved article body.")
+
+
+def prosemirror_plain_text(node: Any) -> str:
+    if not isinstance(node, dict):
+        return ""
+    if node.get("type") == "text":
+        return str(node.get("text") or "")
+    chunks = [prosemirror_plain_text(child) for child in node.get("content") or []]
+    joined = "".join(chunks)
+    if node.get("type") in {"paragraph", "heading", "blockquote", "code_block", "list_item", "captionedImage"}:
+        return joined + "\n"
+    return joined
+
+
+def prosemirror_inline_html(nodes: Any) -> str:
+    if not isinstance(nodes, list):
+        return ""
+    chunks: List[str] = []
+    mark_tags = {"strong": "strong", "em": "em", "underline": "u", "strike": "s", "code": "code"}
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise ValueError("Substack returned an invalid inline node.")
+        node_type = str(node.get("type") or "")
+        if node_type == "hard_break":
+            chunks.append("<br>")
+            continue
+        if node_type != "text":
+            raise ValueError(f"Substack returned an unsupported inline node: {node_type or 'unknown'}.")
+        value = html.escape(str(node.get("text") or ""), quote=False)
+        wrappers: List[Tuple[str, str]] = []
+        for mark in node.get("marks") or []:
+            if not isinstance(mark, dict):
+                raise ValueError("Substack returned an invalid text mark.")
+            mark_type = str(mark.get("type") or "")
+            if mark_type == "link":
+                attrs = mark.get("attrs") if isinstance(mark.get("attrs"), dict) else {}
+                href = safe_web_url(attrs.get("href"), allow_mailto=True)
+                if not href:
+                    raise ValueError("Substack returned an invalid hyperlink.")
+                wrappers.append(
+                    (
+                        f'<a href="{html.escape(href, quote=True)}" target="_blank" rel="noopener noreferrer">',
+                        "</a>",
+                    )
+                )
+            elif mark_type in mark_tags:
+                tag = mark_tags[mark_type]
+                wrappers.append((f"<{tag}>", f"</{tag}>"))
+            else:
+                raise ValueError(f"Substack returned an unsupported text mark: {mark_type or 'unknown'}.")
+        chunks.append("".join(open_tag for open_tag, _ in wrappers) + value + "".join(close_tag for _, close_tag in reversed(wrappers)))
+    return sanitize_inline_html("".join(chunks))
+
+
+def dashboard_blocks_from_substack(post: Dict[str, Any]) -> List[Dict[str, Any]]:
+    document = remote_substack_document(post)
+    cover_url = safe_web_url(post.get("cover_image"))
+    blocks: List[Dict[str, Any]] = []
+
+    def image_block(node: Dict[str, Any]) -> Dict[str, Any]:
+        image_node = node
+        caption = ""
+        if node.get("type") == "captionedImage":
+            image_node = next(
+                (child for child in node.get("content") or [] if isinstance(child, dict) and child.get("type") == "image2"),
+                {},
+            )
+            caption_node = next(
+                (child for child in node.get("content") or [] if isinstance(child, dict) and child.get("type") == "caption"),
+                {},
+            )
+            caption = comparable_copy(prosemirror_plain_text(caption_node))
+        attrs = image_node.get("attrs") if isinstance(image_node.get("attrs"), dict) else {}
+        url = safe_web_url(attrs.get("src"))
+        if not url:
+            raise ValueError("Substack returned an image without a usable URL.")
+        layout = "full" if attrs.get("fullscreen") else ("wide" if cover_url and url == cover_url else "regular")
+        return {
+            "id": block_id(),
+            "type": "image",
+            "url": url,
+            "alt": str(attrs.get("alt") or ""),
+            "caption": caption,
+            "layout": layout,
+        }
+
+    for node in document.get("content") or []:
+        if not isinstance(node, dict):
+            raise ValueError("Substack returned an invalid document block.")
+        node_type = str(node.get("type") or "")
+        if node_type in {"captionedImage", "image2"}:
+            blocks.append(image_block(node))
+        elif node_type == "paragraph":
+            blocks.append({"id": block_id(), "type": "paragraph", "html": prosemirror_inline_html(node.get("content") or [])})
+        elif node_type == "heading":
+            level = int((node.get("attrs") or {}).get("level") or 2) if isinstance(node.get("attrs"), dict) else 2
+            blocks.append(
+                {
+                    "id": block_id(),
+                    "type": "heading" if level <= 2 else "subheading",
+                    "html": prosemirror_inline_html(node.get("content") or []),
+                }
+            )
+        elif node_type == "blockquote":
+            children = node.get("content") or []
+            if not children:
+                blocks.append({"id": block_id(), "type": "quote", "html": ""})
+            for child in children:
+                if not isinstance(child, dict) or child.get("type") != "paragraph":
+                    raise ValueError("Substack returned a quote layout the dashboard cannot represent exactly.")
+                blocks.append({"id": block_id(), "type": "quote", "html": prosemirror_inline_html(child.get("content") or [])})
+        elif node_type == "code_block":
+            blocks.append({"id": block_id(), "type": "code", "html": html.escape(prosemirror_plain_text(node).strip())})
+        elif node_type in {"bullet_list", "ordered_list"}:
+            items: List[str] = []
+            for list_item in node.get("content") or []:
+                children = list_item.get("content") if isinstance(list_item, dict) else []
+                if not isinstance(children, list) or len(children) != 1 or not isinstance(children[0], dict) or children[0].get("type") != "paragraph":
+                    raise ValueError("Substack returned a nested list the dashboard cannot represent exactly.")
+                items.append(prosemirror_inline_html(children[0].get("content") or []))
+            blocks.append(
+                {
+                    "id": block_id(),
+                    "type": "bullet_list" if node_type == "bullet_list" else "numbered_list",
+                    "items": items or [""],
+                }
+            )
+        elif node_type == "horizontal_rule":
+            blocks.append({"id": block_id(), "type": "divider"})
+        else:
+            raise ValueError(f"Substack returned an unsupported document block: {node_type or 'unknown'}.")
+    if cover_url and not any(block.get("type") == "image" and block.get("url") == cover_url for block in blocks):
+        blocks.insert(0, {"id": block_id(), "type": "image", "url": cover_url, "alt": "", "caption": "", "layout": "wide"})
+    return normalize_blocks({"blocks": blocks}, strict=True)
+
+
+def comparable_copy(value: Any) -> str:
+    return re.sub(r"\s+", " ", html.unescape(str(value or ""))).strip()
+
+
+def substack_remote_signature(post: Dict[str, Any]) -> str:
+    document = remote_substack_document(post)
+    return content_hash(
+        {
+            "title": str(post.get("draft_title") or post.get("title") or "").strip(),
+            "subtitle": str(post.get("draft_subtitle") or post.get("subtitle") or "").strip(),
+            "document": document,
+            "cover_image": str(post.get("cover_image") or ""),
+        }
+    )
+
+
+def substack_expected_signature(
+    draft: Dict[str, Any],
+    document: Dict[str, Any],
+    cover_url: Optional[str],
+) -> str:
+    return content_hash(
+        {
+            "title": str(draft.get("title") or "").strip(),
+            "subtitle": str(draft.get("subtitle") or "").strip(),
+            "document": document,
+            "cover_image": str(cover_url or ""),
+        }
+    )
+
+
+def documents_have_same_copy(draft: Dict[str, Any], remote: Dict[str, Any]) -> bool:
+    local_copy = comparable_copy(
+        "\n".join(
+            block_plain_text(block)
+            for block in normalize_blocks(draft)
+            if block.get("type") not in MEDIA_BLOCK_TYPES and block.get("type") != "divider"
+        )
+    )
+    remote_copy = comparable_copy(prosemirror_plain_text(remote_substack_document(remote)))
+    return (
+        normalized_title(draft.get("title")) == normalized_title(remote.get("draft_title") or remote.get("title"))
+        and comparable_copy(draft.get("subtitle")) == comparable_copy(remote.get("draft_subtitle") or remote.get("subtitle"))
+        and local_copy == remote_copy
+    )
+
+
+def image_cache_key(data_uri: str) -> str:
+    _, separator, encoded = data_uri.partition(",")
+    if not separator:
+        raise ValueError("An article image could not be decoded for upload.")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("An article image could not be decoded for upload.") from exc
+    return hashlib.sha256(raw).hexdigest()
+
+
 def upload_substack_images(session: Any, draft: Dict[str, Any]) -> Dict[str, str]:
     ready = publish_ready_draft(draft)
+    cache = read_json_file(SUBSTACK_MEDIA_CACHE_JSON, {})
+    if not isinstance(cache, dict):
+        cache = {}
     uploaded: Dict[str, str] = {}
-    for block in normalize_blocks(ready):
+    cache_changed = False
+    for block in ready.get("blocks") or []:
+        if not isinstance(block, dict):
+            raise ValueError("An article media block became invalid while preparing Substack upload.")
         if block.get("type") != "image":
             continue
         image = str(block.get("url") or "")
         if not image.startswith("data:image/"):
             raise ValueError("An article image could not be prepared for Substack; nothing was published.")
+        cache_key = image_cache_key(image)
+        cached = cache.get(cache_key) if isinstance(cache.get(cache_key), dict) else {}
+        cached_url = safe_web_url(cached.get("url"))
+        if cached_url:
+            uploaded[str(block.get("id") or "")] = cached_url
+            continue
         response = substack_request_json(
             session,
             "POST",
@@ -2406,10 +2935,107 @@ def upload_substack_images(session: Any, draft: Dict[str, Any]) -> Dict[str, str
         if not image_url:
             raise ValueError("Substack image upload returned no usable URL; nothing was published.")
         uploaded[str(block.get("id") or "")] = image_url
+        cache[cache_key] = {"url": image_url, "uploaded_at": now_iso()}
+        cache_changed = True
+    if cache_changed:
+        write_json_atomic(SUBSTACK_MEDIA_CACHE_JSON, cache)
     return uploaded
 
 
-def save_substack_draft(session: Any, profile: Dict[str, Any], draft: Dict[str, Any]) -> Dict[str, Any]:
+def selected_substack_state(values: Dict[str, Any], draft_id: Any = None) -> None:
+    with DRAFT_LOCK:
+        pipeline = ensure_pipeline()
+        selected_id = str(draft_id or pipeline.get("selected_id") or "")
+        selected: Optional[Dict[str, Any]] = None
+        for item in pipeline["items"]:
+            if str(item.get("id") or "") == selected_id:
+                item.update(values)
+                item["updated_at"] = now_iso()
+                selected = item
+                break
+        if selected is not None:
+            write_pipeline(pipeline)
+            current = current_draft()
+            if current and str(current.get("id") or "") == selected_id:
+                current.update(values)
+                current["updated_at"] = selected["updated_at"]
+                write_json_atomic(CURRENT_JSON, current)
+
+
+def resolve_substack_conflict(action: str, base_url: str) -> Dict[str, Any]:
+    if action not in {"keep_dashboard", "use_substack"}:
+        raise ValueError("Unknown conflict resolution action.")
+    draft = current_draft()
+    if not draft:
+        raise ValueError("Create or open a draft first.")
+    post_id = substack_draft_id(draft)
+    if not post_id:
+        raise ValueError("This draft is not linked to a Substack post.")
+    session, _ = substack_authenticated_session()
+    remote = substack_request_json(
+        session,
+        "GET",
+        f"/api/v1/drafts/{post_id}",
+        fallback="Could not read the conflicting Substack draft",
+    )
+    remote_signature = substack_remote_signature(remote)
+    metadata = {
+        "substack_post_id": post_id,
+        "substack_remote_signature": remote_signature,
+        "substack_remote_updated_at": remote.get("draft_updated_at"),
+        "substack_sync_state": "draft_verified",
+        "substack_last_error": None,
+        "substack_conflict_resolved_at": now_iso(),
+    }
+    if action == "keep_dashboard":
+        selected_substack_state(metadata)
+        resolved = current_draft()
+        if not resolved:
+            raise ValueError("The dashboard copy could not be reopened after conflict resolution.")
+        return {"ok": True, "action": action, "draft": resolved, "pipeline": pipeline_payload()}
+
+    archive_editor_revision(draft)
+    updated = dict(draft)
+    updated.update(
+        {
+            "title": str(remote.get("draft_title") or remote.get("title") or draft.get("title") or "Untitled draft")[:240],
+            "subtitle": str(remote.get("draft_subtitle") or remote.get("subtitle") or "")[:500],
+            "blocks": dashboard_blocks_from_substack(remote),
+            **metadata,
+        }
+    )
+    updated["body"] = blocks_plain_text(updated["blocks"])
+    saved = upsert_pipeline_draft(updated, base_url, select=True, local_edit=True)
+    return {"ok": True, "action": action, "draft": saved, "pipeline": pipeline_payload()}
+
+
+def verify_saved_substack_document(
+    session: Any,
+    post_id: int,
+    draft: Dict[str, Any],
+    document: Dict[str, Any],
+    cover_url: Optional[str],
+) -> Dict[str, Any]:
+    latest = substack_request_json(
+        session,
+        "GET",
+        f"/api/v1/drafts/{post_id}",
+        fallback="Substack draft verification failed",
+    )
+    expected_signature = substack_expected_signature(draft, document, cover_url)
+    actual_signature = substack_remote_signature(latest)
+    if actual_signature != expected_signature:
+        raise ValueError("Substack acknowledged the save but returned different title, text, formatting, or media. Nothing else was published.")
+    latest["verified_remote_signature"] = actual_signature
+    return latest
+
+
+def save_substack_draft(
+    session: Any,
+    profile: Dict[str, Any],
+    draft: Dict[str, Any],
+    checkpoint: Optional[Any] = None,
+) -> Dict[str, Any]:
     publication_url = substack_publication_url()
     image_urls = upload_substack_images(session, draft)
     document, cover_url = substack_document(draft, image_urls)
@@ -2422,9 +3048,8 @@ def save_substack_draft(session: Any, profile: Dict[str, Any], draft: Dict[str, 
         "audience": "everyone",
         "should_send_email": True,
         "detect_language": True,
+        "cover_image": cover_url,
     }
-    if cover_url:
-        payload["cover_image"] = cover_url
 
     post_id = substack_draft_id(draft)
     existing: Optional[Dict[str, Any]] = None
@@ -2438,6 +3063,27 @@ def save_substack_draft(session: Any, profile: Dict[str, Any], draft: Dict[str, 
             raise ValueError(substack_error_message(response, "Could not open the existing Substack draft"))
 
     if existing and post_id:
+        baseline = str(draft.get("substack_remote_signature") or "")
+        existing_signature = substack_remote_signature(existing)
+        if baseline and existing_signature != baseline:
+            raise SubstackConflictError("This Substack post changed outside the dashboard. Choose which copy to keep; neither version was overwritten.")
+        if not baseline and not documents_have_same_copy(draft, existing):
+            raise SubstackConflictError("This older Substack draft differs from the dashboard. Choose which copy to keep; neither version was overwritten.")
+        for key in (
+            "type",
+            "audience",
+            "should_send_email",
+            "section_id",
+            "draft_section_id",
+            "subscriber_set_id",
+            "write_comment_permissions",
+            "default_comment_sort",
+            "should_send_free_preview",
+            "free_unlock_required",
+            "hide_from_feed",
+        ):
+            if existing.get(key) is not None:
+                payload[key] = existing[key]
         if existing.get("draft_updated_at"):
             payload["last_updated_at"] = existing["draft_updated_at"]
         saved = substack_request_json(
@@ -2459,28 +3105,306 @@ def save_substack_draft(session: Any, profile: Dict[str, Any], draft: Dict[str, 
     if not saved_id:
         raise ValueError("Substack saved the draft without returning its ID.")
     saved["editor_url"] = f"{publication_url}/publish/post/{saved_id}"
+    if checkpoint:
+        checkpoint(saved_id, saved["editor_url"])
     saved["document"] = document
+    saved["cover_url"] = cover_url
     saved["was_published"] = bool(existing and existing.get("is_published"))
+    latest = verify_saved_substack_document(session, saved_id, draft, document, cover_url)
+    saved["latest"] = latest
+    saved["remote_signature"] = latest["verified_remote_signature"]
     return saved
 
 
-def publish_to_substack(confirm_publish: bool, allow_publish: bool = False) -> Dict[str, Any]:
-    draft = current_draft()
+class PublicPostParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.skip_depth = 0
+        self.text_parts: List[str] = []
+        self.image_attributes: List[str] = []
+        self.link_attributes: List[str] = []
+        self.counts = {"h2": 0, "h3": 0, "blockquote": 0, "strong": 0, "em": 0, "s": 0, "pre": 0, "ul": 0, "ol": 0, "hr": 0}
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style", "noscript"}:
+            self.skip_depth += 1
+            return
+        if tag in self.counts:
+            self.counts[tag] += 1
+        if tag == "img":
+            values = [value or "" for key, value in attrs if key.lower() in {"src", "srcset", "data-src"}]
+            self.image_attributes.append(" ".join(values))
+        if tag == "a":
+            values = [value or "" for key, value in attrs if key.lower() == "href"]
+            self.link_attributes.extend(values)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"script", "style", "noscript"} and self.skip_depth:
+            self.skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self.skip_depth and data.strip():
+            self.text_parts.append(data.strip())
+
+
+def document_image_urls(document: Dict[str, Any]) -> List[str]:
+    urls: List[str] = []
+
+    def visit(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "image2":
+            url = safe_web_url((node.get("attrs") or {}).get("src")) if isinstance(node.get("attrs"), dict) else ""
+            if url:
+                urls.append(url)
+        for child in node.get("content") or []:
+            visit(child)
+
+    visit(document)
+    return urls
+
+
+def document_link_urls(document: Dict[str, Any]) -> List[str]:
+    urls: List[str] = []
+
+    def visit(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        for mark in node.get("marks") or []:
+            if isinstance(mark, dict) and mark.get("type") == "link" and isinstance(mark.get("attrs"), dict):
+                url = safe_web_url(mark["attrs"].get("href"), allow_mailto=True)
+                if url and url not in urls:
+                    urls.append(url)
+        for child in node.get("content") or []:
+            visit(child)
+
+    visit(document)
+    return urls
+
+
+def expected_public_semantics(draft: Dict[str, Any]) -> Dict[str, int]:
+    blocks = normalize_blocks(draft)
+    inline = " ".join(str(block.get("html") or "") for block in blocks)
+    return {
+        "h2": sum(block.get("type") == "heading" for block in blocks),
+        "h3": sum(block.get("type") == "subheading" for block in blocks),
+        "blockquote": sum(block.get("type") in {"pull_quote", "quote"} for block in blocks),
+        "strong": inline.count("<strong>") + inline.count("<b>"),
+        "em": inline.count("<em>") + inline.count("<i>"),
+        "s": inline.count("<s>") + inline.count("<strike>"),
+        "pre": sum(block.get("type") == "code" for block in blocks),
+        "ul": sum(block.get("type") == "bullet_list" for block in blocks),
+        "ol": sum(block.get("type") == "numbered_list" for block in blocks),
+        "hr": sum(block.get("type") == "divider" for block in blocks),
+    }
+
+
+def image_rendered(image_url: str, attributes: List[str]) -> bool:
+    encoded = urllib.parse.quote(image_url, safe="")
+    path_token = Path(urllib.parse.urlparse(image_url).path).name
+    return any(
+        image_url in value or encoded in value or (len(path_token) >= 12 and path_token in value)
+        for value in attributes
+    )
+
+
+def validate_public_substack_html(
+    html_text: str,
+    draft: Dict[str, Any],
+    document: Dict[str, Any],
+) -> Dict[str, Any]:
+    expected_copy = comparable_copy(blocks_plain_text(normalize_blocks(draft)))
+    expected_semantics = expected_public_semantics(draft)
+    expected_images = document_image_urls(document)
+    expected_links = document_link_urls(document)
+    parser = PublicPostParser()
+    parser.feed(html_text)
+    parser.close()
+    visible_copy = comparable_copy(" ".join(parser.text_parts))
+    if comparable_copy(draft.get("title")) not in visible_copy:
+        raise ValueError("The public page does not show the saved title.")
+    subtitle = comparable_copy(draft.get("subtitle"))
+    if subtitle and subtitle not in visible_copy:
+        raise ValueError("The public page does not show the saved subtitle.")
+    copy_samples = [
+        comparable_copy(block_plain_text(block))
+        for block in normalize_blocks(draft)
+        if block.get("type") in TEXT_BLOCK_TYPES | LIST_BLOCK_TYPES
+        and len(comparable_copy(block_plain_text(block))) >= 24
+    ]
+    for sample in copy_samples[:2] + copy_samples[-2:]:
+        if sample and sample not in visible_copy:
+            raise ValueError("The public page is missing saved article text.")
+    for block in normalize_blocks(draft):
+        caption = comparable_copy(block.get("caption")) if block.get("type") in MEDIA_BLOCK_TYPES else ""
+        if caption and caption not in visible_copy:
+            raise ValueError("The public page is missing a saved media caption.")
+    if expected_copy and len(visible_copy) < min(120, len(expected_copy)):
+        raise ValueError("The public page contains less copy than the saved article.")
+    missing_images = [url for url in expected_images if not image_rendered(url, parser.image_attributes)]
+    if missing_images:
+        raise ValueError(f"The public page is missing {len(missing_images)} saved image(s).")
+    rendered_links = {normalized_link_url(value) for value in parser.link_attributes if normalized_link_url(value)}
+    missing_links = [url for url in expected_links if normalized_link_url(url) not in rendered_links]
+    if missing_links:
+        raise ValueError(f"The public page is missing {len(missing_links)} saved hyperlink(s).")
+    for tag, count in expected_semantics.items():
+        if parser.counts.get(tag, 0) < count:
+            raise ValueError(f"The public page is missing saved {tag} formatting.")
+    return {
+        "image_urls": expected_images,
+        "link_count": len(expected_links),
+        "semantic_counts": expected_semantics,
+    }
+
+
+def verify_public_substack_post(
+    session: Any,
+    post_id: int,
+    post_url: str,
+    draft: Dict[str, Any],
+    document: Dict[str, Any],
+    cover_url: Optional[str],
+    *,
+    timeout_seconds: int = PUBLIC_VERIFY_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    deadline = time.monotonic() + max(1, timeout_seconds)
+    last_error = "The public post was not readable yet."
+    while time.monotonic() < deadline:
+        try:
+            latest = verify_saved_substack_document(session, post_id, draft, document, cover_url)
+            if not latest.get("is_published"):
+                raise ValueError("Substack still reports the post as unpublished.")
+            response = session.get(
+                post_url,
+                params={"dashboard_verify": str(int(time.time() * 1000))},
+                headers={"accept": "text/html", "cache-control": "no-cache"},
+                timeout=30,
+            )
+            if response.status_code != 200:
+                raise ValueError(f"The public post returned HTTP {response.status_code}.")
+            rendered = validate_public_substack_html(response.text, draft, document)
+            for image_url in rendered["image_urls"]:
+                image_response = session.get(
+                    image_url,
+                    headers={"accept": "image/*"},
+                    stream=True,
+                    timeout=20,
+                )
+                try:
+                    if image_response.status_code >= 400:
+                        raise ValueError(f"A saved public image returned HTTP {image_response.status_code}.")
+                    content_type = str(image_response.headers.get("content-type") or "").lower()
+                    if content_type and not content_type.startswith("image/"):
+                        raise ValueError("A saved public image URL did not return an image.")
+                finally:
+                    image_response.close()
+            return {
+                "verified_at": now_iso(),
+                "public_url": post_url,
+                "remote_signature": latest["verified_remote_signature"],
+                "image_count": len(rendered["image_urls"]),
+                "link_count": rendered["link_count"],
+                "semantic_counts": rendered["semantic_counts"],
+            }
+        except Exception as exc:
+            last_error = str(exc)
+            if time.monotonic() < deadline:
+                time.sleep(2)
+    raise ValueError(f"Substack accepted the publish request, but public verification failed: {last_error}")
+
+
+def write_publish_attempt(attempt: Dict[str, Any]) -> None:
+    attempt["updated_at"] = now_iso()
+    path = PUBLISH_ATTEMPT_DIR / f"{attempt['id']}.json"
+    write_json_atomic(path, attempt)
+    attempts = sorted(PUBLISH_ATTEMPT_DIR.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)
+    for old_attempt in attempts[200:]:
+        old_attempt.unlink(missing_ok=True)
+
+
+def set_publish_attempt_state(attempt: Dict[str, Any], state: str, **values: Any) -> None:
+    attempt.update(values)
+    attempt["state"] = state
+    write_publish_attempt(attempt)
+
+
+def publish_to_substack(
+    confirm_publish: bool,
+    allow_publish: bool = False,
+    draft_snapshot: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    draft = dict(draft_snapshot) if isinstance(draft_snapshot, dict) else current_draft()
     if not draft:
         raise ValueError("Create or open a draft first.")
+    draft["blocks"] = normalize_blocks(draft, strict=True)
+    draft["body"] = blocks_plain_text(draft["blocks"])
     config = publish_config()
     if not config["configured"]:
         raise ValueError(str(config["message"]))
     if allow_publish and not confirm_publish:
         raise ValueError("Live publishing requires explicit confirmation.")
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    PUBLISH_PAYLOAD_JSON.write_text(json.dumps(draft, indent=2), encoding="utf-8")
-    session, profile = substack_authenticated_session()
-    saved = save_substack_draft(session, profile, draft)
-    post_id = int(saved["id"])
-    editor_url = str(saved["editor_url"])
-    remember_substack_draft_url(editor_url)
-    if allow_publish:
+    write_json_atomic(PUBLISH_PAYLOAD_JSON, draft)
+    attempt = {
+        "id": uuid.uuid4().hex,
+        "draft_id": pipeline_draft_id(draft),
+        "local_content_hash": draft_content_hash(draft),
+        "mode": "publish" if allow_publish else "review",
+        "state": "preparing",
+        "created_at": now_iso(),
+    }
+    write_publish_attempt(attempt)
+    try:
+        session, profile = substack_authenticated_session()
+        set_publish_attempt_state(attempt, "authenticated")
+        def checkpoint_saved_post(post_id: int, editor_url: str) -> None:
+            selected_substack_state(
+                {
+                    "substack_post_id": post_id,
+                    "substack_draft_url": editor_url,
+                    "substack_sync_state": "draft_saving",
+                },
+                attempt["draft_id"],
+            )
+            set_publish_attempt_state(attempt, "draft_saved_unverified", post_id=post_id, editor_url=editor_url)
+
+        saved = save_substack_draft(session, profile, draft, checkpoint=checkpoint_saved_post)
+        post_id = int(saved["id"])
+        editor_url = str(saved["editor_url"])
+        latest = saved["latest"]
+        identity = {
+            "substack_post_id": post_id,
+            "substack_uuid": str(latest.get("uuid") or "") or None,
+            "substack_slug": str(latest.get("slug") or "") or None,
+            "substack_draft_url": editor_url,
+            "substack_remote_signature": saved["remote_signature"],
+            "substack_remote_updated_at": latest.get("draft_updated_at"),
+            "substack_last_synced_local_hash": draft_content_hash(draft),
+            "substack_sync_state": "draft_verified",
+        }
+        selected_substack_state(identity, attempt["draft_id"])
+        set_publish_attempt_state(
+            attempt,
+            "draft_verified",
+            post_id=post_id,
+            editor_url=editor_url,
+            remote_signature=saved["remote_signature"],
+        )
+        if not allow_publish:
+            result = {
+                "ok": True,
+                "status": "draft_saved",
+                "message": "Saved and verified as a Substack draft in the background.",
+                "current_url": editor_url,
+                "post_id": post_id,
+                "attempt_id": attempt["id"],
+                "draft_id": attempt["draft_id"],
+            }
+            set_publish_attempt_state(attempt, "complete", result=result)
+            write_json_atomic(PUBLISH_RESULT_JSON, result)
+            return result
+
         prepublish = substack_request_json(
             session,
             "GET",
@@ -2490,19 +3414,20 @@ def publish_to_substack(confirm_publish: bool, allow_publish: bool = False) -> D
         errors = prepublish.get("errors") or []
         if errors:
             messages = [
-                str(item.get("message") or item.get("msg") or item)
-                if isinstance(item, dict)
-                else str(item)
+                str(item.get("message") or item.get("msg") or item) if isinstance(item, dict) else str(item)
                 for item in errors
             ]
             raise ValueError(f"Substack blocked publishing: {' '.join(messages)}")
+        send_email = not bool(saved.get("was_published"))
+        set_publish_attempt_state(attempt, "publish_requesting", send_email=send_email)
         published = substack_request_json(
             session,
             "POST",
             f"/api/v1/drafts/{post_id}/publish",
-            payload={"send": not bool(saved.get("was_published"))},
+            payload={"send": send_email},
             fallback="Substack publish failed",
         )
+        set_publish_attempt_state(attempt, "publish_accepted")
         latest = substack_request_json(
             session,
             "GET",
@@ -2510,29 +3435,75 @@ def publish_to_substack(confirm_publish: bool, allow_publish: bool = False) -> D
             fallback="Published post verification failed",
         )
         slug = str(latest.get("slug") or published.get("slug") or "").strip()
-        post_url = f"{substack_publication_url()}/p/{slug}" if slug else substack_publication_url()
+        if not slug:
+            raise ValueError("Substack accepted publishing but returned no public post URL.")
+        post_url = f"{substack_publication_url()}/p/{urllib.parse.quote(slug)}"
+        verification = verify_public_substack_post(
+            session,
+            post_id,
+            post_url,
+            draft,
+            saved["document"],
+            saved.get("cover_url"),
+        )
         result = {
             "ok": True,
-            "status": "published",
+            "status": "published_verified",
             "message": (
-                "Updated the live Substack post."
+                "Updated and verified the live Substack post."
                 if saved.get("was_published")
-                else "Published to Substack and sent to subscribers."
+                else "Published to Substack, sent to subscribers, and verified the live post."
             ),
             "current_url": post_url,
             "post_url": post_url,
             "post_id": post_id,
+            "attempt_id": attempt["id"],
+            "draft_id": attempt["draft_id"],
+            "verification": verification,
         }
-    else:
-        result = {
-            "ok": True,
-            "status": "draft_saved",
-            "message": "Saved as a Substack draft in the background.",
-            "current_url": editor_url,
-            "post_id": post_id,
+        selected_substack_state(
+            {
+                **identity,
+                "substack_slug": slug,
+                "substack_url": post_url,
+                "substack_sync_state": "public_verified",
+                "substack_public_verified_at": verification["verified_at"],
+            },
+            attempt["draft_id"],
+        )
+        set_publish_attempt_state(attempt, "complete", public_url=post_url, verification=verification, result=result)
+        write_json_atomic(PUBLISH_RESULT_JSON, result)
+        return result
+    except Exception as exc:
+        if attempt.get("state") in {"publish_requesting", "publish_accepted"} and attempt.get("post_id"):
+            selected_substack_state(
+                {
+                    "substack_sync_state": "publish_unverified",
+                    "substack_last_error": str(exc),
+                    "substack_last_attempt_id": attempt["id"],
+                },
+                attempt["draft_id"],
+            )
+        elif attempt.get("post_id"):
+            selected_substack_state(
+                {
+                    "substack_sync_state": "draft_unverified",
+                    "substack_last_error": str(exc),
+                    "substack_last_attempt_id": attempt["id"],
+                },
+                attempt["draft_id"],
+            )
+        set_publish_attempt_state(attempt, "failed", error=str(exc))
+        failure = {
+            "ok": False,
+            "status": "failed",
+            "message": str(exc),
+            "attempt_id": attempt["id"],
+            "post_id": attempt.get("post_id"),
+            "draft_id": attempt["draft_id"],
         }
-    PUBLISH_RESULT_JSON.write_text(json.dumps(result, indent=2), encoding="utf-8")
-    return result
+        write_json_atomic(PUBLISH_RESULT_JSON, failure)
+        raise
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2554,7 +3525,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("cache-control", "no-store")
         self.end_headers()
         if self.command != "HEAD":
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
     def send_json(self, payload: Any, status: int = 200) -> None:
         code, body, content_type = json_bytes(payload, status)
@@ -2577,7 +3551,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/bootstrap":
             self.send_json(bootstrap_payload())
         elif path == "/api/current":
-            last_publish = json.loads(PUBLISH_RESULT_JSON.read_text(encoding="utf-8")) if PUBLISH_RESULT_JSON.exists() else None
+            last_publish = read_json_file(PUBLISH_RESULT_JSON)
             self.send_json({"draft": current_draft(), "publish": publish_config(), "last_publish": last_publish})
         elif path == "/api/drafts":
             self.send_json(pipeline_payload())
@@ -2610,7 +3584,13 @@ class Handler(BaseHTTPRequestHandler):
             payload = read_json_body(self)
             if path == "/api/ingest":
                 draft = build_draft(str(payload.get("url") or ""))
-                self.send_json({"ok": True, "draft": upsert_pipeline_draft(draft, self.base_url, select=True), "pipeline": pipeline_payload()})
+                self.send_json(
+                    {
+                        "ok": True,
+                        "draft": upsert_pipeline_draft(draft, self.base_url, select=True, source_snapshot=True),
+                        "pipeline": pipeline_payload(),
+                    }
+                )
             elif path == "/api/media":
                 self.send_json({"ok": True, "media": save_media_upload(payload)}, 201)
             elif path == "/api/drafts/new":
@@ -2625,6 +3605,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/drafts/sync":
                 result = sync_x_articles(self.base_url)
                 self.send_json(result, 200 if result.get("ok") else 502)
+            elif path == "/api/substack/conflict":
+                self.send_json(resolve_substack_conflict(str(payload.get("action") or ""), self.base_url))
             elif path == "/api/publish":
                 mode = str(payload.get("mode") or "review")
                 if mode not in {"review", "publish"}:
@@ -2636,22 +3618,24 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("A Substack save or publish is already running. Wait a moment and retry.")
                 try:
                     editor_draft = payload.get("draft")
+                    saved_editor_draft: Optional[Dict[str, Any]] = None
                     if isinstance(editor_draft, dict):
-                        save_dashboard_draft(editor_draft, self.base_url)
+                        saved_editor_draft = save_dashboard_draft(editor_draft, self.base_url)
                     result = publish_to_substack(
                         confirm_publish=confirmed,
                         allow_publish=mode == "publish" and confirmed,
+                        draft_snapshot=saved_editor_draft,
                     )
                 finally:
                     PUBLISH_LOCK.release()
-                if result.get("ok") and result.get("status") == "published":
-                    mark_selected_published(result.get("post_url"))
-                elif result.get("ok") and result.get("current_url"):
-                    remember_substack_draft_url(result["current_url"])
+                if result.get("ok") and result.get("status") == "published_verified":
+                    mark_selected_published(result.get("post_url"), result.get("draft_id"))
                 result["pipeline"] = pipeline_payload()
                 self.send_json(result)
             else:
                 self.send_json({"error": "Not found"}, 404)
+        except SubstackConflictError as exc:
+            self.send_json({"error": str(exc), "code": "substack_conflict"}, 409)
         except ValueError as exc:
             self.send_json({"error": str(exc)}, 400)
         except Exception as exc:

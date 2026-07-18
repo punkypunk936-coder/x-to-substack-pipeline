@@ -405,8 +405,21 @@ class RichDraftTests(unittest.TestCase):
             os.environ["SUBSTACK_PUBLICATION_URL"] = "https://example.substack.com"
             server.upload_substack_images = lambda _session, _draft: {}
 
+            saved_payload = {}
+
             def fake_request(session, method, path, *, payload=None, fallback):
                 calls.append({"session": session, "method": method, "path": path, "payload": payload, "fallback": fallback})
+                if method == "POST":
+                    saved_payload.update(payload or {})
+                if method == "GET":
+                    return {
+                        "id": 42,
+                        "draft_title": saved_payload["draft_title"],
+                        "draft_subtitle": saved_payload["draft_subtitle"],
+                        "draft_body": saved_payload["draft_body"],
+                        "cover_image": saved_payload["cover_image"],
+                        "draft_updated_at": "2026-07-18T10:00:00Z",
+                    }
                 return {"id": 42, "draft_updated_at": "2026-07-18T10:00:00Z"}
 
             server.substack_request_json = fake_request
@@ -421,7 +434,7 @@ class RichDraftTests(unittest.TestCase):
             )
 
             self.assertEqual(saved["editor_url"], "https://example.substack.com/publish/post/42")
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), 2)
             self.assertEqual(calls[0]["method"], "POST")
             self.assertEqual(calls[0]["path"], "/api/v1/drafts")
             self.assertEqual(calls[0]["payload"]["draft_bylines"], [{"id": 7, "is_guest": False}])
@@ -440,13 +453,24 @@ class RichDraftTests(unittest.TestCase):
         previous_request = server.substack_request_json
         previous_publication_url = os.environ.get("SUBSTACK_PUBLICATION_URL")
         calls = []
+        local_document, _ = server.substack_document(
+            {"blocks": [{"type": "paragraph", "html": "The updated article body."}]}
+        )
 
         class FakeResponse:
             status_code = 200
 
             @staticmethod
             def json():
-                return {"id": 42, "is_published": True, "draft_updated_at": "2026-07-18T10:00:00Z"}
+                return {
+                    "id": 42,
+                    "is_published": True,
+                    "draft_title": "Updated post",
+                    "draft_subtitle": "",
+                    "draft_body": json.dumps(local_document),
+                    "cover_image": None,
+                    "draft_updated_at": "2026-07-18T10:00:00Z",
+                }
 
         class FakeSession:
             @staticmethod
@@ -457,8 +481,22 @@ class RichDraftTests(unittest.TestCase):
             os.environ["SUBSTACK_PUBLICATION_URL"] = "https://example.substack.com"
             server.upload_substack_images = lambda _session, _draft: {}
 
+            saved_payload = {}
+
             def fake_request(session, method, path, *, payload=None, fallback):
                 calls.append({"method": method, "path": path, "payload": payload})
+                if method == "PUT":
+                    saved_payload.update(payload or {})
+                if method == "GET":
+                    return {
+                        "id": 42,
+                        "is_published": True,
+                        "draft_title": saved_payload["draft_title"],
+                        "draft_subtitle": saved_payload["draft_subtitle"],
+                        "draft_body": saved_payload["draft_body"],
+                        "cover_image": saved_payload["cover_image"],
+                        "draft_updated_at": "2026-07-18T10:01:00Z",
+                    }
                 return {"id": 42, "draft_updated_at": "2026-07-18T10:01:00Z"}
 
             server.substack_request_json = fake_request
@@ -736,6 +774,310 @@ class RichDraftTests(unittest.TestCase):
             self.assertEqual(ready["blocks"][0]["url"], "data:image/jpeg;base64,VEVTVA==")
         finally:
             server.download_remote_image = previous_download
+
+    def test_source_refresh_cannot_overwrite_dashboard_edits(self) -> None:
+        previous_pipeline = server.DRAFT_PIPELINE_JSON
+        previous_current = server.CURRENT_JSON
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                server.DRAFT_PIPELINE_JSON = Path(directory) / "pipeline.json"
+                server.CURRENT_JSON = Path(directory) / "current.json"
+                server.write_json_atomic(server.DRAFT_PIPELINE_JSON, server.empty_pipeline())
+                source = {
+                    "id": "1234567890123456789",
+                    "url": "https://x.com/0xgoodie/status/1234567890123456789",
+                    "source": "fxtwitter_read_api",
+                    "title": "Source title",
+                    "blocks": [{"id": "copy", "type": "paragraph", "html": "The exact original source paragraph."}],
+                }
+                server.upsert_pipeline_draft(source, "http://127.0.0.1:8788", select=False, source_snapshot=True)
+                edited = {
+                    **source,
+                    "title": "My edited title",
+                    "blocks": [{"id": "copy", "type": "paragraph", "html": "My dashboard edit must survive every later source refresh."}],
+                }
+                server.upsert_pipeline_draft(edited, "http://127.0.0.1:8788", select=False, local_edit=True)
+                server.upsert_pipeline_draft(source, "http://127.0.0.1:8788", select=False, source_snapshot=True)
+
+                saved = server.read_pipeline()["items"][0]
+
+                self.assertEqual(saved["title"], "My edited title")
+                self.assertIn("must survive", saved["blocks"][0]["html"])
+                self.assertTrue(saved["user_modified"])
+                self.assertFalse(saved["source_changed_since_edit"])
+                self.assertNotEqual(saved["local_content_hash"], saved["source_content_hash"])
+        finally:
+            server.DRAFT_PIPELINE_JSON = previous_pipeline
+            server.CURRENT_JSON = previous_current
+
+    def test_source_hash_migration_detects_existing_local_edits(self) -> None:
+        previous_pipeline = server.DRAFT_PIPELINE_JSON
+        previous_current = server.CURRENT_JSON
+        source = {
+            "id": "1234567890123456789",
+            "url": "https://x.com/0xgoodie/status/1234567890123456789",
+            "source": "fxtwitter_read_api",
+            "title": "Migration title",
+            "blocks": [{"type": "paragraph", "html": "Original X article copy."}],
+        }
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                server.DRAFT_PIPELINE_JSON = Path(directory) / "pipeline.json"
+                server.CURRENT_JSON = Path(directory) / "current.json"
+                local = {
+                    **source,
+                    "blocks": [{"type": "paragraph", "html": "Existing dashboard edit that must remain untouched."}],
+                    "status": "draft",
+                }
+                server.write_json_atomic(server.DRAFT_PIPELINE_JSON, {"selected_id": source["id"], "items": [local]})
+                server.write_json_atomic(server.CURRENT_JSON, local)
+
+                result = server.audit_pipeline_source_hashes(fetcher=lambda _url: source)
+                saved = server.read_pipeline()["items"][0]
+
+                self.assertEqual(result["protected"], [source["id"]])
+                self.assertTrue(saved["user_modified"])
+                self.assertIn("must remain untouched", saved["blocks"][0]["html"])
+                self.assertNotEqual(saved["source_content_hash"], saved["local_content_hash"])
+        finally:
+            server.DRAFT_PIPELINE_JSON = previous_pipeline
+            server.CURRENT_JSON = previous_current
+
+    def test_editor_rejects_unknown_blocks_instead_of_flattening_them(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported editor block"):
+            server.normalize_blocks({"blocks": [{"type": "mystery-layout", "html": "Do not flatten me."}]}, strict=True)
+
+    def test_nested_x_lists_are_rejected_instead_of_flattened(self) -> None:
+        article = {
+            "content": {
+                "entityMap": {},
+                "blocks": [
+                    {
+                        "key": "nested",
+                        "type": "unordered-list-item",
+                        "depth": 1,
+                        "text": "Nested item",
+                        "inlineStyleRanges": [],
+                        "entityRanges": [],
+                    }
+                ],
+            }
+        }
+
+        with self.assertRaisesRegex(ValueError, "Nested X Article lists"):
+            server.draftjs_blocks(article)
+
+    def test_substack_remote_edit_conflict_is_rejected_before_update(self) -> None:
+        previous_upload = server.upload_substack_images
+        previous_request = server.substack_request_json
+        previous_publication_url = os.environ.get("SUBSTACK_PUBLICATION_URL")
+        calls = []
+        remote_document, _ = server.substack_document(
+            {"blocks": [{"type": "paragraph", "html": "Remote copy changed outside the dashboard."}]}
+        )
+
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "id": 42,
+                    "draft_title": "Conflict",
+                    "draft_subtitle": "",
+                    "draft_body": json.dumps(remote_document),
+                    "cover_image": None,
+                    "draft_updated_at": "2026-07-18T10:00:00Z",
+                }
+
+        class FakeSession:
+            @staticmethod
+            def get(_url, timeout):
+                return FakeResponse()
+
+        try:
+            os.environ["SUBSTACK_PUBLICATION_URL"] = "https://example.substack.com"
+            server.upload_substack_images = lambda _session, _draft: {}
+            server.substack_request_json = lambda *args, **kwargs: calls.append((args, kwargs)) or {}
+            with self.assertRaisesRegex(ValueError, "changed outside the dashboard"):
+                server.save_substack_draft(
+                    FakeSession(),
+                    {"id": 7},
+                    {
+                        "title": "Conflict",
+                        "substack_post_id": 42,
+                        "substack_remote_signature": "stale-signature",
+                        "blocks": [{"type": "paragraph", "html": "Local dashboard copy."}],
+                    },
+                )
+            self.assertEqual(calls, [])
+        finally:
+            server.upload_substack_images = previous_upload
+            server.substack_request_json = previous_request
+            if previous_publication_url is None:
+                os.environ.pop("SUBSTACK_PUBLICATION_URL", None)
+            else:
+                os.environ["SUBSTACK_PUBLICATION_URL"] = previous_publication_url
+
+    def test_substack_media_upload_is_cached_by_image_bytes(self) -> None:
+        previous_cache = server.SUBSTACK_MEDIA_CACHE_JSON
+        previous_download = server.download_remote_image
+        previous_request = server.substack_request_json
+        calls = []
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                server.SUBSTACK_MEDIA_CACHE_JSON = Path(directory) / "media-cache.json"
+                server.download_remote_image = lambda _url: "data:image/png;base64,VEVTVA=="
+
+                def fake_request(*args, **kwargs):
+                    calls.append((args, kwargs))
+                    return {"url": "https://substackcdn.com/image/uploaded.png"}
+
+                server.substack_request_json = fake_request
+                draft = {
+                    "blocks": [
+                        {
+                            "id": "banner",
+                            "type": "image",
+                            "url": "https://pbs.twimg.com/media/BANNER.png",
+                            "layout": "wide",
+                        }
+                    ]
+                }
+
+                first = server.upload_substack_images(object(), draft)
+                second = server.upload_substack_images(object(), draft)
+
+                self.assertEqual(first, second)
+                self.assertEqual(len(calls), 1)
+        finally:
+            server.SUBSTACK_MEDIA_CACHE_JSON = previous_cache
+            server.download_remote_image = previous_download
+            server.substack_request_json = previous_request
+
+    def test_unverified_publish_is_not_reconciled_as_published(self) -> None:
+        previous_pipeline = server.DRAFT_PIPELINE_JSON
+        previous_fetch = server.fetch_substack_publications
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                server.DRAFT_PIPELINE_JSON = Path(directory) / "pipeline.json"
+                server.write_json_atomic(
+                    server.DRAFT_PIPELINE_JSON,
+                    {
+                        "selected_id": "200",
+                        "items": [
+                            {
+                                "id": "200",
+                                "title": "Accepted but not verified",
+                                "status": "draft",
+                                "substack_post_id": 42,
+                                "substack_sync_state": "publish_unverified",
+                            }
+                        ],
+                    },
+                )
+                server.fetch_substack_publications = lambda: [
+                    {
+                        "post_id": 42,
+                        "title": "Accepted but not verified",
+                        "url": "https://example.substack.com/p/accepted",
+                        "published_at": "2026-07-18T10:00:00Z",
+                    }
+                ]
+
+                result = server.reconcile_substack_publications()
+                saved = server.read_pipeline()["items"][0]
+
+                self.assertEqual(result["updated"], [])
+                self.assertEqual(saved["status"], "draft")
+        finally:
+            server.DRAFT_PIPELINE_JSON = previous_pipeline
+            server.fetch_substack_publications = previous_fetch
+
+    def test_public_verification_requires_saved_images_links_and_formatting(self) -> None:
+        draft = {
+            "title": "Verified public article",
+            "blocks": [
+                {"id": "banner", "type": "image", "url": "https://source.example/banner.png", "layout": "wide"},
+                {
+                    "id": "copy",
+                    "type": "paragraph",
+                    "html": '<strong>This complete paragraph must render with its exact saved formatting and <a href="https://example.com/evidence">evidence link</a>.</strong>',
+                },
+            ],
+        }
+        document, _ = server.substack_document(draft, {"banner": "https://substackcdn.com/banner-123456789.png"})
+        complete_html = (
+            "<html><body><h1>Verified public article</h1>"
+            '<img src="https://substackcdn.com/banner-123456789.png">'
+            '<p><strong>This complete paragraph must render with its exact saved formatting and '
+            '<a href="https://example.com/evidence">evidence link</a>.</strong></p></body></html>'
+        )
+
+        report = server.validate_public_substack_html(complete_html, draft, document)
+
+        self.assertEqual(report["link_count"], 1)
+        self.assertEqual(len(report["image_urls"]), 1)
+        with self.assertRaisesRegex(ValueError, "missing 1 saved image"):
+            server.validate_public_substack_html(complete_html.replace('<img src="https://substackcdn.com/banner-123456789.png">', ""), draft, document)
+        with self.assertRaisesRegex(ValueError, "missing 1 saved hyperlink"):
+            server.validate_public_substack_html(complete_html.replace("https://example.com/evidence", "https://example.com/wrong"), draft, document)
+
+    def test_substack_document_can_be_loaded_back_without_flattening(self) -> None:
+        draft = {
+            "blocks": [
+                {"id": "cover", "type": "image", "url": "https://source.example/cover.png", "layout": "wide", "caption": "Cover caption"},
+                {"type": "heading", "html": "A heading"},
+                {
+                    "type": "paragraph",
+                    "html": '<strong>Bold</strong> and <a href="https://example.com/source">linked</a> copy.',
+                },
+                {"type": "bullet_list", "items": ["First", "Second"]},
+                {"type": "quote", "html": "Quoted copy"},
+            ]
+        }
+        document, _ = server.substack_document(draft, {"cover": "https://substackcdn.com/cover-123456789.png"})
+        post = {
+            "draft_body": json.dumps(document),
+            "cover_image": "https://substackcdn.com/cover-123456789.png",
+        }
+
+        blocks = server.dashboard_blocks_from_substack(post)
+
+        self.assertEqual([block["type"] for block in blocks], ["image", "heading", "paragraph", "bullet_list", "quote"])
+        self.assertEqual(blocks[0]["layout"], "wide")
+        self.assertIn("<strong>Bold</strong>", blocks[2]["html"])
+        self.assertIn('href="https://example.com/source"', blocks[2]["html"])
+
+    def test_publish_completion_updates_the_attempted_draft_not_current_selection(self) -> None:
+        previous_pipeline = server.DRAFT_PIPELINE_JSON
+        previous_current = server.CURRENT_JSON
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                server.DRAFT_PIPELINE_JSON = Path(directory) / "pipeline.json"
+                server.CURRENT_JSON = Path(directory) / "current.json"
+                server.write_json_atomic(
+                    server.DRAFT_PIPELINE_JSON,
+                    {
+                        "selected_id": "newer",
+                        "items": [
+                            {"id": "attempted", "title": "Attempted", "status": "draft"},
+                            {"id": "newer", "title": "Newer selection", "status": "draft"},
+                        ],
+                    },
+                )
+
+                server.mark_selected_published("https://example.substack.com/p/attempted", "attempted")
+                pipeline = server.read_pipeline()
+                attempted = next(item for item in pipeline["items"] if item["id"] == "attempted")
+                newer = next(item for item in pipeline["items"] if item["id"] == "newer")
+
+                self.assertEqual(attempted["status"], "published")
+                self.assertEqual(newer["status"], "draft")
+                self.assertEqual(pipeline["selected_id"], "newer")
+        finally:
+            server.DRAFT_PIPELINE_JSON = previous_pipeline
+            server.CURRENT_JSON = previous_current
 
 
 if __name__ == "__main__":

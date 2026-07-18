@@ -18,6 +18,9 @@ let currentDraft = null;
 let currentPipeline = null;
 let editorBlocks = [];
 let editorDirty = false;
+let editorRevision = 0;
+let editorSession = 0;
+let saveInFlight = null;
 let autosaveTimer = null;
 let activeBlockId = null;
 let mediaSourceMode = "upload";
@@ -29,6 +32,7 @@ let pipelineRefreshInFlight = false;
 let syncInFlight = false;
 let ingestConfigured = false;
 let publishConfigured = false;
+let conflictRetryMode = "review";
 
 function setStatus(message, mode = "idle") {
   const node = $("#statusLine");
@@ -197,6 +201,8 @@ function draftHtml(draft) {
 }
 
 function renderDraft(draft) {
+  editorSession += 1;
+  editorRevision = 0;
   currentDraft = draft;
   editorBlocks = draftBlocks(draft);
   $("#workspace").classList.remove("hidden");
@@ -235,6 +241,7 @@ function pipelineKey(pipeline) {
       item.media_count,
       item.updated_at,
       item.substack_url,
+      item.substack_sync_state,
     ]),
     sync: [
       pipeline.sync?.status,
@@ -266,7 +273,13 @@ function renderPipeline(pipeline, { force = false } = {}) {
 
     const status = document.createElement("span");
     status.className = `draft-status ${item.status === "published" ? "published" : ""}`;
-    status.textContent = item.status === "published" ? "Published" : "Draft";
+    status.textContent = item.status === "published"
+      ? "Published"
+      : ["draft_unverified", "publish_unverified"].includes(item.substack_sync_state)
+        ? "Needs verification"
+        : item.substack_sync_state === "draft_verified"
+          ? "Substack draft"
+          : "Draft";
 
     const title = document.createElement("strong");
     title.textContent = item.title || "Untitled X article";
@@ -623,6 +636,7 @@ function changeBlockType(id, nextType) {
 
 function markDirty({ render = true } = {}) {
   editorDirty = true;
+  editorRevision += 1;
   setSaveState("Unsaved changes", "saving");
   if (render) {
     updateEditMeta();
@@ -631,7 +645,13 @@ function markDirty({ render = true } = {}) {
     updateEditMeta();
   }
   window.clearTimeout(autosaveTimer);
-  autosaveTimer = window.setTimeout(() => saveDraft({ quiet: true, autosave: true }).catch(() => {}), 1200);
+  autosaveTimer = window.setTimeout(() => {
+    saveDraft({ quiet: true, autosave: true }).catch((error) => {
+      editorDirty = true;
+      setSaveState("Autosave failed", "error");
+      setStatus(`Autosave failed: ${error.message}`, "error");
+    });
+  }, 1200);
 }
 
 function updateEditMeta() {
@@ -672,6 +692,8 @@ function captureVisibleEditorState() {
   }
   if (changed) {
     editorDirty = true;
+    editorRevision += 1;
+    setSaveState("Unsaved changes", "saving");
     updateEditMeta();
     renderInlinePreview();
   }
@@ -702,39 +724,76 @@ async function api(path, options = {}) {
     ...options,
     headers: { "content-type": "application/json", ...(options.headers || {}) },
   });
-  const data = await response.json();
-  if (!response.ok || data.error) throw new Error(data.error || `Request failed: ${response.status}`);
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    throw new Error(`The dashboard returned an unreadable response (${response.status}). Your local draft was not marked saved.`);
+  }
+  if (!response.ok || data.error) {
+    const error = new Error(data.error || `Request failed: ${response.status}`);
+    error.code = data.code || "request_failed";
+    throw error;
+  }
   return data;
 }
 
 async function saveDraft({ quiet = false, autosave = false } = {}) {
   if (!currentDraft) throw new Error("Create a draft first.");
-  captureVisibleEditorState();
-  window.clearTimeout(autosaveTimer);
-  setSaveState(autosave ? "Autosaving..." : "Saving...", "saving");
-  const data = await api("/api/draft", {
-    method: "POST",
-    body: JSON.stringify({
+  if (saveInFlight) {
+    await saveInFlight;
+    return editorDirty ? saveDraft({ quiet, autosave }) : currentDraft;
+  }
+  const operation = (async () => {
+    captureVisibleEditorState();
+    window.clearTimeout(autosaveTimer);
+    const savingRevision = editorRevision;
+    const savingSession = editorSession;
+    const snapshot = {
       title: $("#editTitle").value,
       subtitle: $("#editSubtitle").value,
-      blocks: editorBlocks,
-    }),
-  });
-  currentDraft = data.draft;
-  editorBlocks = draftBlocks(data.draft);
-  editorDirty = false;
-  renderPipeline(data.pipeline);
-  $("#draftTitle").textContent = data.draft.title;
-  $("#draftSubtitle").textContent = data.draft.subtitle || "";
-  $("#draftMeta").textContent = `${data.draft.source || "source"} / ${wordCount()} words / ${mediaCount()} media item(s)`;
-  setSaveState(autosave ? "Autosaved" : "Saved locally");
-  if (!quiet) setStatus("Draft changes saved.", "ok");
-  return data.draft;
+      blocks: JSON.parse(JSON.stringify(editorBlocks)),
+    };
+    setSaveState(autosave ? "Autosaving..." : "Saving...", "saving");
+    const data = await api("/api/draft", {
+      method: "POST",
+      body: JSON.stringify(snapshot),
+    });
+    if (savingSession !== editorSession) return data.draft;
+    currentDraft = data.draft;
+    renderPipeline(data.pipeline);
+    if (savingRevision === editorRevision) {
+      editorBlocks = draftBlocks(data.draft);
+      editorDirty = false;
+      $("#draftTitle").textContent = data.draft.title;
+      $("#draftSubtitle").textContent = data.draft.subtitle || "";
+      $("#draftMeta").textContent = `${data.draft.source || "source"} / ${wordCount()} words / ${mediaCount()} media item(s)`;
+      setSaveState(autosave ? "Autosaved" : "Saved locally");
+      if (!quiet) setStatus("Draft changes saved.", "ok");
+    } else {
+      editorDirty = true;
+      setSaveState("Newer changes not saved yet", "saving");
+      window.clearTimeout(autosaveTimer);
+      autosaveTimer = window.setTimeout(() => {
+        saveDraft({ quiet: true, autosave: true }).catch((error) => {
+          setSaveState("Autosave failed", "error");
+          setStatus(`Autosave failed: ${error.message}`, "error");
+        });
+      }, 250);
+    }
+    return data.draft;
+  })();
+  saveInFlight = operation;
+  try {
+    return await operation;
+  } finally {
+    if (saveInFlight === operation) saveInFlight = null;
+  }
 }
 
 async function prepareSavedDraft() {
   window.clearTimeout(autosaveTimer);
-  if (editorDirty) await saveDraft({ quiet: true });
+  while (editorDirty || saveInFlight) await saveDraft({ quiet: true });
 }
 
 async function selectDraft(id) {
@@ -851,7 +910,8 @@ async function sendToSubstack(mode) {
     return;
   }
   const button = mode === "publish" ? $("#publishButton") : $("#substackDraftButton");
-  button.disabled = true;
+  $("#publishButton").disabled = true;
+  $("#substackDraftButton").disabled = true;
   try {
     captureVisibleEditorState();
     await prepareSavedDraft();
@@ -859,6 +919,14 @@ async function sendToSubstack(mode) {
       const confirmed = window.confirm(`Publish “${currentDraft.title}” to Everyone now? Substack will also send it by email and in the Substack app.`);
       if (!confirmed) return;
     }
+    captureVisibleEditorState();
+    await prepareSavedDraft();
+    const publishSnapshot = {
+      title: $("#editTitle").value,
+      subtitle: $("#editSubtitle").value,
+      blocks: JSON.parse(JSON.stringify(editorBlocks)),
+    };
+    $("#editor").inert = true;
     $("#publishLine").textContent = mode === "publish" ? "Publishing to Substack..." : "Saving a Substack draft in the background...";
     setStatus(mode === "publish" ? "Publishing the saved rich draft..." : "Sending the saved rich draft to Substack...", "busy");
     const result = await api("/api/publish", {
@@ -866,11 +934,7 @@ async function sendToSubstack(mode) {
       body: JSON.stringify({
         mode,
         confirm_publish: mode === "publish",
-        draft: {
-          title: $("#editTitle").value,
-          subtitle: $("#editSubtitle").value,
-          blocks: editorBlocks,
-        },
+        draft: publishSnapshot,
       }),
     });
     if (result.pipeline) renderPipeline(result.pipeline);
@@ -879,8 +943,42 @@ async function sendToSubstack(mode) {
   } catch (error) {
     $("#publishLine").textContent = error.message;
     setStatus(error.message, "error");
+    if (error.code === "substack_conflict") {
+      conflictRetryMode = mode;
+      $("#conflictMessage").textContent = error.message;
+      $("#conflictDialog").showModal();
+    }
   } finally {
-    button.disabled = !publishConfigured;
+    $("#editor").inert = false;
+    $("#publishButton").disabled = !publishConfigured;
+    $("#substackDraftButton").disabled = !publishConfigured;
+  }
+}
+
+async function resolveSubstackConflict(action) {
+  const keepButton = $("#keepDashboardCopy");
+  const useButton = $("#useSubstackCopy");
+  keepButton.disabled = true;
+  useButton.disabled = true;
+  try {
+    const data = await api("/api/substack/conflict", {
+      method: "POST",
+      body: JSON.stringify({ action }),
+    });
+    renderPipeline(data.pipeline);
+    renderDraft(data.draft);
+    $("#conflictDialog").close();
+    if (action === "keep_dashboard") {
+      setStatus("Dashboard copy kept. Rechecking it before Substack save.", "busy");
+      await sendToSubstack(conflictRetryMode);
+    } else {
+      setStatus("Loaded the Substack copy. The previous dashboard revision is backed up.", "ok");
+    }
+  } catch (error) {
+    setStatus(error.message, "error");
+  } finally {
+    keepButton.disabled = false;
+    useButton.disabled = false;
   }
 }
 
@@ -1173,6 +1271,9 @@ $("#uploadMediaTab").addEventListener("click", () => setMediaSourceMode("upload"
 $("#urlMediaTab").addEventListener("click", () => setMediaSourceMode("url"));
 $("#closeMediaDialog").addEventListener("click", closeMediaDialog);
 $("#cancelMedia").addEventListener("click", closeMediaDialog);
+$("#closeConflictDialog").addEventListener("click", () => $("#conflictDialog").close());
+$("#keepDashboardCopy").addEventListener("click", () => resolveSubstackConflict("keep_dashboard"));
+$("#useSubstackCopy").addEventListener("click", () => resolveSubstackConflict("use_substack"));
 $("#substackDraftButton").addEventListener("click", () => sendToSubstack("review"));
 $("#publishButton").addEventListener("click", () => sendToSubstack("publish"));
 $("#syncButton").addEventListener("click", () => syncDrafts());

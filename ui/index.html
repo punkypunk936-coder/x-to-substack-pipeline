@@ -192,6 +192,22 @@
       </div>
     </form>
   </dialog>
+  <dialog id="conflictDialog" class="media-dialog conflict-dialog">
+    <div class="dialog-form">
+      <div class="dialog-header">
+        <div>
+          <p class="kicker">Two saved versions</p>
+          <h2>Choose the copy to keep</h2>
+        </div>
+        <button id="closeConflictDialog" type="button" class="tool-button" aria-label="Close" title="Close">X</button>
+      </div>
+      <p id="conflictMessage" class="conflict-message"></p>
+      <div class="conflict-actions">
+        <button id="useSubstackCopy" type="button" class="secondary-button">Load Substack copy</button>
+        <button id="keepDashboardCopy" type="button">Keep dashboard copy</button>
+      </div>
+    </div>
+  </dialog>
   <script src="/app.js"></script>
 </body>
 </html>

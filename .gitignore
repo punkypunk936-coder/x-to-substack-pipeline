@@ -9,6 +9,8 @@ data/publish_result.json
 data/x_extract_result.json
 data/draft_pipeline.json
 data/sync_state.json
+data/substack_media_cache.json
+data/publish_attempts/
 data/media/
 data/backups/
 dist/draft.html
