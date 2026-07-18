@@ -9,6 +9,32 @@ import server
 
 
 class RichDraftTests(unittest.TestCase):
+    def test_original_draft_can_start_empty_and_keeps_a_stable_pipeline_id(self) -> None:
+        draft = server.build_original_draft()
+
+        self.assertEqual(draft["source"], "original")
+        self.assertEqual(draft["blocks"][0]["type"], "paragraph")
+        self.assertTrue(server.is_draft_usable(draft))
+        self.assertEqual(server.pipeline_draft_id(draft), draft["id"])
+
+    def test_original_drafts_are_ignored_by_x_layout_backfill(self) -> None:
+        previous_pipeline_path = server.DRAFT_PIPELINE_JSON
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                server.DRAFT_PIPELINE_JSON = Path(directory) / "pipeline.json"
+                draft = server.build_original_draft()
+                server.DRAFT_PIPELINE_JSON.write_text(json.dumps({"selected_id": draft["id"], "items": [draft]}))
+
+                result = server.backfill_pipeline_drafts(
+                    "http://127.0.0.1:8788",
+                    fetcher=lambda _url: self.fail("Original drafts must not enter X backfill."),
+                )
+
+                self.assertEqual(result["upgraded"], [])
+                self.assertEqual(result["skipped"], [])
+        finally:
+            server.DRAFT_PIPELINE_JSON = previous_pipeline_path
+
     def test_official_x_article_preserves_banner_links_and_inline_media(self) -> None:
         body = "Read the linked words exactly as written.\n\nThe second paragraph keeps the article structure intact."
         link_text = "linked words"

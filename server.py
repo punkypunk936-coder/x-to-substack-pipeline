@@ -610,6 +610,8 @@ def is_login_wall(text: str) -> bool:
 def is_draft_usable(draft: Dict[str, Any]) -> bool:
     body = clean_text(str(draft.get("body") or ""))
     blocks = normalize_blocks(draft) if isinstance(draft.get("blocks"), list) else []
+    if str(draft.get("source") or "") == "original":
+        return bool(str(draft.get("title") or "").strip()) and bool(blocks)
     media = list(draft.get("media") or []) or [block for block in blocks if block.get("type") in MEDIA_BLOCK_TYPES]
     if is_login_wall(body):
         return False
@@ -1309,6 +1311,8 @@ def now_iso() -> str:
 
 
 def pipeline_draft_id(draft: Dict[str, Any]) -> str:
+    if str(draft.get("source") or "") == "original" and draft.get("id"):
+        return block_id(draft["id"])
     x_id = extract_x_id(str(draft.get("url") or ""))
     if x_id:
         return x_id
@@ -1316,6 +1320,21 @@ def pipeline_draft_id(draft: Dict[str, Any]) -> str:
         f"{draft.get('date') or dt.date.today().isoformat()}-{draft.get('title') or 'draft'}",
         "draft",
     )
+
+
+def build_original_draft() -> Dict[str, Any]:
+    return {
+        "id": f"original-{uuid.uuid4().hex[:12]}",
+        "source": "original",
+        "title": "Untitled draft",
+        "subtitle": "",
+        "url": "",
+        "date": dt.date.today().isoformat(),
+        "body": "",
+        "blocks": [{"id": block_id(), "type": "paragraph", "html": ""}],
+        "media": [],
+        "extraction_version": "original_v1",
+    }
 
 
 def empty_pipeline() -> Dict[str, Any]:
@@ -1901,7 +1920,11 @@ def backfill_pipeline_drafts(
     candidates = [
         dict(item)
         for item in snapshot.get("items", [])
-        if isinstance(item, dict) and str(item.get("extraction_version") or "") != RICH_EXTRACTION_VERSION
+        if (
+            isinstance(item, dict)
+            and extract_x_id(str(item.get("url") or ""))
+            and str(item.get("extraction_version") or "") != RICH_EXTRACTION_VERSION
+        )
     ]
     upgraded: List[str] = []
     skipped: List[Dict[str, str]] = []
@@ -2148,10 +2171,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "draft": upsert_pipeline_draft(draft, self.base_url, select=True), "pipeline": pipeline_payload()})
             elif path == "/api/media":
                 self.send_json({"ok": True, "media": save_media_upload(payload)}, 201)
+            elif path == "/api/drafts/new":
+                draft = upsert_pipeline_draft(build_original_draft(), self.base_url, select=True)
+                self.send_json({"ok": True, "draft": draft, "pipeline": pipeline_payload()}, 201)
             elif path == "/api/draft":
                 draft = current_draft()
                 if not draft:
-                    raise ValueError("Create a draft from an X article first.")
+                    raise ValueError("Create or open a draft first.")
                 title = str(payload.get("title") or "").strip()
                 if not isinstance(payload.get("blocks"), list):
                     raise ValueError("Draft blocks are required.")
@@ -2159,7 +2185,7 @@ class Handler(BaseHTTPRequestHandler):
                 body = blocks_plain_text(blocks)
                 if not title:
                     raise ValueError("Draft title cannot be empty.")
-                if word_count(body) < 12:
+                if str(draft.get("source") or "") != "original" and word_count(body) < 12:
                     raise ValueError("Draft body is too short to save.")
                 draft.update(
                     {

@@ -12,6 +12,7 @@ const BLOCK_LABELS = {
   numbered_list: "Numbered list",
   code: "Code",
 };
+const INSERT_BLOCK_LABELS = { ...BLOCK_LABELS, divider: "Divider" };
 
 let currentDraft = null;
 let currentPipeline = null;
@@ -322,6 +323,34 @@ function blockTypeSelect(block) {
   return select;
 }
 
+function inlineBlockInserter(block) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "inline-block-inserter";
+  const select = document.createElement("select");
+  select.className = "inline-block-select";
+  select.title = "Insert a block directly below";
+  select.setAttribute("aria-label", "Insert block below");
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "+ Add below";
+  placeholder.selected = true;
+  placeholder.disabled = true;
+  select.appendChild(placeholder);
+  for (const [value, label] of Object.entries(INSERT_BLOCK_LABELS)) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    select.appendChild(option);
+  }
+  select.addEventListener("change", () => {
+    const type = select.value;
+    if (!type) return;
+    insertBlock({ id: uid(), type }, block.id);
+  });
+  wrapper.appendChild(select);
+  return wrapper;
+}
+
 function blockControls(block, index) {
   const controls = document.createElement("div");
   controls.className = "block-controls";
@@ -486,7 +515,7 @@ function renderBlocks({ focusId = null } = {}) {
       content = document.createElement("hr");
       content.className = "block-divider";
     }
-    row.append(grip, content, blockControls(block, index));
+    row.append(grip, content, blockControls(block, index), inlineBlockInserter(block));
     editor.appendChild(row);
   });
   if (focusId) focusBlock(focusId);
@@ -748,6 +777,26 @@ async function ingest() {
     setStatus(error.message, "error");
   } finally {
     $("#ingestButton").disabled = !ingestConfigured;
+  }
+}
+
+async function createBlankDraft() {
+  if (editorDirty && !window.confirm("Start a blank draft and leave the current unsaved changes?")) return;
+  const button = $("#newDraftButton");
+  button.disabled = true;
+  setStatus("Opening a blank draft...", "busy");
+  try {
+    const data = await api("/api/drafts/new", { method: "POST", body: "{}" });
+    renderPipeline(data.pipeline);
+    renderDraft(data.draft);
+    setDraftView("edit");
+    $("#editTitle").focus();
+    $("#editTitle").select();
+    setStatus("Blank draft ready.", "ok");
+  } catch (error) {
+    setStatus(error.message, "error");
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -1031,6 +1080,7 @@ $("#blockEditor").addEventListener("drop", (event) => {
 });
 
 $("#ingestButton").addEventListener("click", ingest);
+$("#newDraftButton").addEventListener("click", createBlankDraft);
 $("#xUrl").addEventListener("keydown", (event) => { if (event.key === "Enter") ingest(); });
 $("#editTab").addEventListener("click", () => setDraftView("edit"));
 $("#previewTab").addEventListener("click", () => setDraftView("preview"));
