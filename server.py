@@ -41,9 +41,11 @@ DRAFT_PIPELINE_JSON = DATA_DIR / "draft_pipeline.json"
 SYNC_STATE_JSON = DATA_DIR / "sync_state.json"
 MEDIA_DIR = DATA_DIR / "media"
 PIPELINE_BACKUP_DIR = DATA_DIR / "backups"
+EDITOR_BACKUP_DIR = PIPELINE_BACKUP_DIR / "editor"
 ENV_FILE = ROOT / ".env"
 DRAFT_LOCK = threading.RLock()
 SYNC_LOCK = threading.Lock()
+PUBLISH_LOCK = threading.Lock()
 
 TEXT_BLOCK_TYPES = {"paragraph", "heading", "subheading", "pull_quote", "quote", "code"}
 LIST_BLOCK_TYPES = {"bullet_list", "numbered_list"}
@@ -503,8 +505,6 @@ def substack_document(
         block_type = str(block.get("type") or "paragraph")
         block_id_value = str(block.get("id") or "")
         if block_type == "image":
-            if block_id_value == cover_block_id:
-                continue
             image_url = image_urls.get(block_id_value) or str(block.get("url") or "")
             attrs = {
                 "src": image_url,
@@ -1461,6 +1461,54 @@ def current_draft() -> Optional[Dict[str, Any]]:
     return draft if is_draft_usable(draft) else None
 
 
+def archive_editor_revision(draft: Dict[str, Any]) -> None:
+    EDITOR_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    draft_id = block_id(draft.get("id") or pipeline_draft_id(draft))
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    path = EDITOR_BACKUP_DIR / f"{draft_id}-{timestamp}.json"
+    path.write_text(json.dumps(draft, indent=2, ensure_ascii=False), encoding="utf-8")
+    revisions = sorted(EDITOR_BACKUP_DIR.glob(f"{draft_id}-*.json"), key=lambda item: item.stat().st_mtime, reverse=True)
+    for old_revision in revisions[50:]:
+        old_revision.unlink(missing_ok=True)
+
+
+def save_dashboard_draft(payload: Dict[str, Any], base_url: str) -> Dict[str, Any]:
+    draft = current_draft()
+    if not draft:
+        raise ValueError("Create or open a draft first.")
+    title = str(payload.get("title") or "").strip()
+    if not isinstance(payload.get("blocks"), list):
+        raise ValueError("Draft blocks are required.")
+    blocks = normalize_blocks({"blocks": payload["blocks"]})
+    body = blocks_plain_text(blocks)
+    if not title:
+        raise ValueError("Draft title cannot be empty.")
+    if str(draft.get("source") or "") != "original" and word_count(body) < 12:
+        raise ValueError("Draft body is too short to save.")
+    updated = dict(draft)
+    updated.update(
+        {
+            "title": title[:240],
+            "subtitle": str(payload.get("subtitle") or "").strip()[:500],
+            "body": body,
+            "blocks": blocks,
+        }
+    )
+    previous_state = json.dumps(
+        {"title": draft.get("title"), "subtitle": draft.get("subtitle"), "blocks": normalize_blocks(draft)},
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    next_state = json.dumps(
+        {"title": updated.get("title"), "subtitle": updated.get("subtitle"), "blocks": blocks},
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    if previous_state != next_state:
+        archive_editor_revision(draft)
+    return upsert_pipeline_draft(updated, base_url, select=True)
+
+
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
 
@@ -2384,7 +2432,7 @@ def save_substack_draft(session: Any, profile: Dict[str, Any], draft: Dict[str, 
         response = session.get(f"{publication_url}/api/v1/drafts/{post_id}", timeout=30)
         if response.status_code == 200:
             candidate = response.json()
-            if isinstance(candidate, dict) and not candidate.get("is_published"):
+            if isinstance(candidate, dict):
                 existing = candidate
         elif response.status_code not in {404, 410}:
             raise ValueError(substack_error_message(response, "Could not open the existing Substack draft"))
@@ -2412,6 +2460,7 @@ def save_substack_draft(session: Any, profile: Dict[str, Any], draft: Dict[str, 
         raise ValueError("Substack saved the draft without returning its ID.")
     saved["editor_url"] = f"{publication_url}/publish/post/{saved_id}"
     saved["document"] = document
+    saved["was_published"] = bool(existing and existing.get("is_published"))
     return saved
 
 
@@ -2451,7 +2500,7 @@ def publish_to_substack(confirm_publish: bool, allow_publish: bool = False) -> D
             session,
             "POST",
             f"/api/v1/drafts/{post_id}/publish",
-            payload={"send": True},
+            payload={"send": not bool(saved.get("was_published"))},
             fallback="Substack publish failed",
         )
         latest = substack_request_json(
@@ -2465,7 +2514,11 @@ def publish_to_substack(confirm_publish: bool, allow_publish: bool = False) -> D
         result = {
             "ok": True,
             "status": "published",
-            "message": "Published to Substack and sent to subscribers.",
+            "message": (
+                "Updated the live Substack post."
+                if saved.get("was_published")
+                else "Published to Substack and sent to subscribers."
+            ),
             "current_url": post_url,
             "post_url": post_url,
             "post_id": post_id,
@@ -2564,27 +2617,8 @@ class Handler(BaseHTTPRequestHandler):
                 draft = upsert_pipeline_draft(build_original_draft(), self.base_url, select=True)
                 self.send_json({"ok": True, "draft": draft, "pipeline": pipeline_payload()}, 201)
             elif path == "/api/draft":
-                draft = current_draft()
-                if not draft:
-                    raise ValueError("Create or open a draft first.")
-                title = str(payload.get("title") or "").strip()
-                if not isinstance(payload.get("blocks"), list):
-                    raise ValueError("Draft blocks are required.")
-                blocks = normalize_blocks({"blocks": payload["blocks"]})
-                body = blocks_plain_text(blocks)
-                if not title:
-                    raise ValueError("Draft title cannot be empty.")
-                if str(draft.get("source") or "") != "original" and word_count(body) < 12:
-                    raise ValueError("Draft body is too short to save.")
-                draft.update(
-                    {
-                        "title": title[:240],
-                        "subtitle": str(payload.get("subtitle") or "").strip()[:500],
-                        "body": body,
-                        "blocks": blocks,
-                    }
-                )
-                self.send_json({"ok": True, "draft": upsert_pipeline_draft(draft, self.base_url, select=True), "pipeline": pipeline_payload()})
+                draft = save_dashboard_draft(payload, self.base_url)
+                self.send_json({"ok": True, "draft": draft, "pipeline": pipeline_payload()})
             elif path == "/api/drafts/select":
                 draft = select_pipeline_draft(str(payload.get("id") or ""), self.base_url)
                 self.send_json({"ok": True, "draft": draft, "pipeline": pipeline_payload()})
@@ -2598,10 +2632,18 @@ class Handler(BaseHTTPRequestHandler):
                 confirmed = bool(payload.get("confirm_publish"))
                 if mode == "publish" and not confirmed:
                     raise ValueError("Live publishing requires explicit confirmation.")
-                result = publish_to_substack(
-                    confirm_publish=confirmed,
-                    allow_publish=mode == "publish" and confirmed,
-                )
+                if not PUBLISH_LOCK.acquire(blocking=False):
+                    raise ValueError("A Substack save or publish is already running. Wait a moment and retry.")
+                try:
+                    editor_draft = payload.get("draft")
+                    if isinstance(editor_draft, dict):
+                        save_dashboard_draft(editor_draft, self.base_url)
+                    result = publish_to_substack(
+                        confirm_publish=confirmed,
+                        allow_publish=mode == "publish" and confirmed,
+                    )
+                finally:
+                    PUBLISH_LOCK.release()
                 if result.get("ok") and result.get("status") == "published":
                     mark_selected_published(result.get("post_url"))
                 elif result.get("ok") and result.get("current_url"):

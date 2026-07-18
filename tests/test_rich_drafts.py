@@ -387,9 +387,10 @@ class RichDraftTests(unittest.TestCase):
         self.assertEqual(cover, "https://substackcdn.com/cover.png")
         self.assertEqual(
             [node["type"] for node in document["content"]],
-            ["heading", "paragraph", "bullet_list", "blockquote", "captionedImage"],
+            ["captionedImage", "heading", "paragraph", "bullet_list", "blockquote", "captionedImage"],
         )
-        paragraph = document["content"][1]
+        self.assertEqual(document["content"][0]["content"][0]["attrs"]["src"], "https://substackcdn.com/cover.png")
+        paragraph = document["content"][2]
         self.assertEqual(paragraph["content"][0]["marks"][0]["type"], "strong")
         self.assertEqual(paragraph["content"][2]["marks"][0]["type"], "em")
         self.assertEqual(paragraph["content"][4]["marks"][0]["attrs"]["href"], "https://example.com/source")
@@ -426,6 +427,54 @@ class RichDraftTests(unittest.TestCase):
             self.assertEqual(calls[0]["payload"]["draft_bylines"], [{"id": 7, "is_guest": False}])
             body = json.loads(calls[0]["payload"]["draft_body"])
             self.assertEqual(body["content"][0]["content"][1]["marks"][0]["type"], "strong")
+        finally:
+            server.upload_substack_images = previous_upload
+            server.substack_request_json = previous_request
+            if previous_publication_url is None:
+                os.environ.pop("SUBSTACK_PUBLICATION_URL", None)
+            else:
+                os.environ["SUBSTACK_PUBLICATION_URL"] = previous_publication_url
+
+    def test_substack_draft_save_reuses_a_published_post_for_live_updates(self) -> None:
+        previous_upload = server.upload_substack_images
+        previous_request = server.substack_request_json
+        previous_publication_url = os.environ.get("SUBSTACK_PUBLICATION_URL")
+        calls = []
+
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"id": 42, "is_published": True, "draft_updated_at": "2026-07-18T10:00:00Z"}
+
+        class FakeSession:
+            @staticmethod
+            def get(_url, timeout):
+                return FakeResponse()
+
+        try:
+            os.environ["SUBSTACK_PUBLICATION_URL"] = "https://example.substack.com"
+            server.upload_substack_images = lambda _session, _draft: {}
+
+            def fake_request(session, method, path, *, payload=None, fallback):
+                calls.append({"method": method, "path": path, "payload": payload})
+                return {"id": 42, "draft_updated_at": "2026-07-18T10:01:00Z"}
+
+            server.substack_request_json = fake_request
+            saved = server.save_substack_draft(
+                FakeSession(),
+                {"id": 7},
+                {
+                    "title": "Updated post",
+                    "substack_draft_url": "https://example.substack.com/publish/post/42",
+                    "blocks": [{"type": "paragraph", "html": "The updated article body."}],
+                },
+            )
+
+            self.assertEqual(calls[0]["method"], "PUT")
+            self.assertEqual(calls[0]["path"], "/api/v1/drafts/42")
+            self.assertTrue(saved["was_published"])
         finally:
             server.upload_substack_images = previous_upload
             server.substack_request_json = previous_request

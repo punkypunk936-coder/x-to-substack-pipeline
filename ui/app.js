@@ -638,6 +638,46 @@ function updateEditMeta() {
   $("#editMeta").textContent = `${wordCount()} words · ${editorBlocks.length} blocks · ${mediaCount()} media`;
 }
 
+function captureVisibleEditorState() {
+  let changed = false;
+  for (const block of editorBlocks) {
+    const row = document.querySelector(`[data-block-id="${CSS.escape(block.id)}"]`);
+    if (!row) continue;
+    if (TEXT_BLOCK_TYPES.has(block.type)) {
+      const content = row.querySelector(".block-content[contenteditable='true']");
+      const next = sanitizeInline(content?.innerHTML || "");
+      if (next !== block.html) {
+        block.html = next;
+        changed = true;
+      }
+    } else if (LIST_BLOCK_TYPES.has(block.type)) {
+      const next = [...row.querySelectorAll(".list-item")].map((item) => sanitizeInline(item.innerHTML));
+      if (JSON.stringify(next) !== JSON.stringify(block.items || [])) {
+        block.items = next;
+        changed = true;
+      }
+    } else if (block.type === "image") {
+      const caption = row.querySelector(".image-caption")?.value || "";
+      if (caption !== block.caption) {
+        block.caption = caption;
+        changed = true;
+      }
+    } else if (block.type === "embed") {
+      const caption = row.querySelector(".embed-caption")?.value || "";
+      if (caption !== block.caption) {
+        block.caption = caption;
+        changed = true;
+      }
+    }
+  }
+  if (changed) {
+    editorDirty = true;
+    updateEditMeta();
+    renderInlinePreview();
+  }
+  return editorBlocks;
+}
+
 function renderInlinePreview() {
   $("#previewTitle").textContent = $("#editTitle").value || "Untitled";
   const subtitle = $("#editSubtitle").value.trim();
@@ -669,6 +709,7 @@ async function api(path, options = {}) {
 
 async function saveDraft({ quiet = false, autosave = false } = {}) {
   if (!currentDraft) throw new Error("Create a draft first.");
+  captureVisibleEditorState();
   window.clearTimeout(autosaveTimer);
   setSaveState(autosave ? "Autosaving..." : "Saving...", "saving");
   const data = await api("/api/draft", {
@@ -812,6 +853,7 @@ async function sendToSubstack(mode) {
   const button = mode === "publish" ? $("#publishButton") : $("#substackDraftButton");
   button.disabled = true;
   try {
+    captureVisibleEditorState();
     await prepareSavedDraft();
     if (mode === "publish") {
       const confirmed = window.confirm(`Publish “${currentDraft.title}” to Everyone now? Substack will also send it by email and in the Substack app.`);
@@ -821,7 +863,15 @@ async function sendToSubstack(mode) {
     setStatus(mode === "publish" ? "Publishing the saved rich draft..." : "Sending the saved rich draft to Substack...", "busy");
     const result = await api("/api/publish", {
       method: "POST",
-      body: JSON.stringify({ mode, confirm_publish: mode === "publish" }),
+      body: JSON.stringify({
+        mode,
+        confirm_publish: mode === "publish",
+        draft: {
+          title: $("#editTitle").value,
+          subtitle: $("#editSubtitle").value,
+          blocks: editorBlocks,
+        },
+      }),
     });
     if (result.pipeline) renderPipeline(result.pipeline);
     $("#publishLine").textContent = result.message || result.status || "Substack step finished.";
