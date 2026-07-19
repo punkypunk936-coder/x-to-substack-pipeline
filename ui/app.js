@@ -12,7 +12,6 @@ const BLOCK_LABELS = {
   numbered_list: "Numbered list",
   code: "Code",
 };
-const INSERT_BLOCK_LABELS = { ...BLOCK_LABELS, divider: "Divider" };
 
 let currentDraft = null;
 let currentPipeline = null;
@@ -25,7 +24,6 @@ let autosaveTimer = null;
 let activeBlockId = null;
 let mediaSourceMode = "upload";
 let mediaEditingId = null;
-let draggedBlockId = null;
 let pipelineRenderKey = "";
 let pipelineRefreshTimer = null;
 let pipelineRefreshInFlight = false;
@@ -33,6 +31,8 @@ let syncInFlight = false;
 let ingestConfigured = false;
 let publishConfigured = false;
 let conflictRetryMode = "review";
+let savedSelectionRange = null;
+let selectionToolbarTimer = null;
 
 function setStatus(message, mode = "idle") {
   const node = $("#statusLine");
@@ -201,6 +201,7 @@ function draftHtml(draft) {
 }
 
 function renderDraft(draft) {
+  hideSelectionToolbar();
   editorSession += 1;
   editorRevision = 0;
   currentDraft = draft;
@@ -321,271 +322,111 @@ function makeToolButton(label, title, handler) {
   return button;
 }
 
-function blockTypeSelect(block) {
-  const select = document.createElement("select");
-  select.className = "block-type-control";
-  select.setAttribute("aria-label", "Change block type");
-  for (const [value, label] of Object.entries(BLOCK_LABELS)) {
-    const option = document.createElement("option");
-    option.value = value;
-    option.textContent = label;
-    option.selected = value === block.type;
-    select.appendChild(option);
+function articleBlockElement(block) {
+  let element;
+  if (block.type === "paragraph") element = document.createElement("p");
+  else if (block.type === "heading") element = document.createElement("h2");
+  else if (block.type === "subheading") element = document.createElement("h3");
+  else if (block.type === "pull_quote" || block.type === "quote") element = document.createElement("blockquote");
+  else if (block.type === "code") element = document.createElement("pre");
+  else if (block.type === "bullet_list") element = document.createElement("ul");
+  else if (block.type === "numbered_list") element = document.createElement("ol");
+  else if (block.type === "divider") element = document.createElement("hr");
+  else if (block.type === "image") element = document.createElement("figure");
+  else if (block.type === "embed") element = document.createElement("aside");
+  else element = document.createElement("p");
+
+  element.className = `article-editor-block article-editor-${block.type}`;
+  element.dataset.blockId = block.id;
+  element.dataset.type = block.type;
+
+  if (TEXT_BLOCK_TYPES.has(block.type)) {
+    if (block.type === "code") element.textContent = plainText(block.html);
+    else element.innerHTML = sanitizeInline(block.html);
+    element.dataset.placeholder = BLOCK_LABELS[block.type] || "Write something";
+    element.spellcheck = block.type !== "code";
+  } else if (LIST_BLOCK_TYPES.has(block.type)) {
+    for (const value of block.items || [""]) {
+      const item = document.createElement("li");
+      item.innerHTML = sanitizeInline(value);
+      element.appendChild(item);
+    }
+  } else if (block.type === "divider") {
+    element.contentEditable = "false";
+  } else if (block.type === "image") {
+    element.contentEditable = "false";
+    element.dataset.url = block.url;
+    element.dataset.alt = block.alt || "";
+    element.dataset.layout = block.layout || "regular";
+    const image = document.createElement("img");
+    image.src = block.url;
+    image.alt = block.alt || "";
+    image.draggable = false;
+    image.addEventListener("dblclick", () => openMediaDialog(block.id));
+    const caption = document.createElement("figcaption");
+    caption.className = "image-caption-inline";
+    caption.contentEditable = "true";
+    caption.dataset.placeholder = "Add caption";
+    caption.textContent = block.caption || "";
+    const controls = document.createElement("div");
+    controls.className = "media-inline-controls";
+    controls.contentEditable = "false";
+    controls.append(
+      makeToolButton("Edit", "Edit image", () => openMediaDialog(block.id)),
+      makeToolButton("×", "Delete image", () => deleteBlock(block.id)),
+    );
+    element.append(image, caption, controls);
+  } else if (block.type === "embed") {
+    element.contentEditable = "false";
+    element.dataset.url = block.url;
+    const link = document.createElement("a");
+    link.href = block.url;
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.textContent = block.url;
+    const caption = document.createElement("input");
+    caption.className = "embed-caption";
+    caption.placeholder = "Add caption";
+    caption.value = block.caption || "";
+    const controls = document.createElement("div");
+    controls.className = "media-inline-controls";
+    controls.contentEditable = "false";
+    controls.append(makeToolButton("×", "Delete embed", () => deleteBlock(block.id)));
+    element.append(link, caption, controls);
   }
-  select.addEventListener("change", () => changeBlockType(block.id, select.value));
-  return select;
-}
-
-function inlineBlockInserter(block) {
-  const wrapper = document.createElement("div");
-  wrapper.className = "inline-block-inserter";
-  const select = document.createElement("select");
-  select.className = "inline-block-select";
-  select.title = "Insert a block directly below";
-  select.setAttribute("aria-label", "Insert block below");
-  const placeholder = document.createElement("option");
-  placeholder.value = "";
-  placeholder.textContent = "+ Add below";
-  placeholder.selected = true;
-  placeholder.disabled = true;
-  select.appendChild(placeholder);
-  for (const [value, label] of Object.entries(INSERT_BLOCK_LABELS)) {
-    const option = document.createElement("option");
-    option.value = value;
-    option.textContent = label;
-    select.appendChild(option);
-  }
-  select.addEventListener("change", () => {
-    const type = select.value;
-    if (!type) return;
-    insertBlock({ id: uid(), type }, block.id);
-  });
-  wrapper.appendChild(select);
-  return wrapper;
-}
-
-function blockControls(block, index) {
-  const controls = document.createElement("div");
-  controls.className = "block-controls";
-  if (TEXT_BLOCK_TYPES.has(block.type) || LIST_BLOCK_TYPES.has(block.type)) controls.appendChild(blockTypeSelect(block));
-  if (block.type === "image") {
-    const editButton = makeToolButton("Edit", "Edit image", () => openMediaDialog(block.id));
-    editButton.classList.add("media-edit-button");
-    controls.appendChild(editButton);
-  }
-  controls.appendChild(makeToolButton("↑", "Move block up", () => moveBlock(block.id, -1)));
-  controls.appendChild(makeToolButton("↓", "Move block down", () => moveBlock(block.id, 1)));
-  controls.appendChild(makeToolButton("×", "Delete block", () => deleteBlock(block.id)));
-  controls.querySelectorAll("button").forEach((button) => {
-    if (button.title === "Move block up") button.disabled = index === 0;
-    if (button.title === "Move block down") button.disabled = index === editorBlocks.length - 1;
-  });
-  return controls;
-}
-
-function textContentNode(block) {
-  const content = document.createElement("div");
-  content.className = "block-content";
-  content.contentEditable = "true";
-  content.spellcheck = block.type !== "code";
-  content.dataset.placeholder = BLOCK_LABELS[block.type] || "Write something";
-  content.innerHTML = sanitizeInline(block.html);
-  content.addEventListener("input", () => {
-    block.html = sanitizeInline(content.innerHTML);
-    markDirty();
-  });
-  content.addEventListener("focus", () => { activeBlockId = block.id; });
-  content.addEventListener("keydown", (event) => handleTextKeydown(event, block, content));
-  return content;
-}
-
-function listContentNode(block) {
-  const list = document.createElement(block.type === "bullet_list" ? "ul" : "ol");
-  list.className = "block-list";
-  const syncItems = () => {
-    block.items = [...list.querySelectorAll(".list-item")].map((item) => sanitizeInline(item.innerHTML));
-  };
-  const makeItem = (value = "") => {
-    const item = document.createElement("li");
-    item.className = "list-item";
-    item.contentEditable = "true";
-    item.spellcheck = true;
-    item.dataset.placeholder = "List item";
-    item.innerHTML = sanitizeInline(value);
-    item.addEventListener("keydown", (event) => {
-      if (handleFormattingShortcut(event)) return;
-      if (event.key === "Enter") {
-        event.preventDefault();
-        const selection = window.getSelection();
-        let before = sanitizeInline(item.innerHTML);
-        let after = "";
-        if (selection?.rangeCount && item.contains(selection.anchorNode)) {
-          const range = selection.getRangeAt(0);
-          const beforeRange = document.createRange();
-          beforeRange.selectNodeContents(item);
-          beforeRange.setEnd(range.startContainer, range.startOffset);
-          const afterRange = document.createRange();
-          afterRange.selectNodeContents(item);
-          afterRange.setStart(range.endContainer, range.endOffset);
-          const beforeBox = document.createElement("div");
-          const afterBox = document.createElement("div");
-          beforeBox.appendChild(beforeRange.cloneContents());
-          afterBox.appendChild(afterRange.cloneContents());
-          before = sanitizeInline(beforeBox.innerHTML);
-          after = sanitizeInline(afterBox.innerHTML);
-        }
-        item.innerHTML = before;
-        const next = makeItem(after);
-        item.after(next);
-        syncItems();
-        markDirty();
-        next.focus();
-      } else if (event.key === "Backspace" && !plainText(item.innerHTML) && list.children.length > 1) {
-        event.preventDefault();
-        const previous = item.previousElementSibling || item.nextElementSibling;
-        item.remove();
-        syncItems();
-        markDirty();
-        previous?.focus();
-      }
-    });
-    return item;
-  };
-  for (const value of block.items || [""]) list.appendChild(makeItem(value));
-  list.addEventListener("input", () => {
-    syncItems();
-    markDirty();
-  });
-  list.addEventListener("focusin", () => { activeBlockId = block.id; });
-  return list;
-}
-
-function imageContentNode(block) {
-  const figure = document.createElement("figure");
-  figure.className = "image-block-editor";
-  figure.dataset.layout = block.layout || "regular";
-  const image = document.createElement("img");
-  image.src = block.url;
-  image.alt = block.alt || "";
-  const caption = document.createElement("input");
-  caption.className = "image-caption";
-  caption.placeholder = "Add caption";
-  caption.value = block.caption || "";
-  caption.addEventListener("input", () => {
-    block.caption = caption.value;
-    markDirty();
-  });
-  caption.addEventListener("focus", () => { activeBlockId = block.id; });
-  figure.append(image, caption);
-  return figure;
-}
-
-function embedContentNode(block) {
-  const wrapper = document.createElement("div");
-  wrapper.className = "embed-block-editor";
-  const link = document.createElement("a");
-  link.href = block.url;
-  link.target = "_blank";
-  link.rel = "noopener";
-  link.textContent = block.url;
-  const caption = document.createElement("input");
-  caption.className = "embed-caption";
-  caption.placeholder = "Add caption";
-  caption.value = block.caption || "";
-  caption.addEventListener("input", () => {
-    block.caption = caption.value;
-    markDirty();
-  });
-  wrapper.append(link, caption);
-  return wrapper;
+  return element;
 }
 
 function renderBlocks({ focusId = null } = {}) {
   const editor = $("#blockEditor");
+  editor.contentEditable = "true";
+  editor.spellcheck = true;
   editor.replaceChildren();
-  editorBlocks.forEach((block, index) => {
-    const row = document.createElement("section");
-    row.className = "editor-block";
-    row.dataset.blockId = block.id;
-    row.dataset.type = block.type;
-
-    const grip = makeToolButton("⋮⋮", "Drag to reorder", () => {});
-    grip.classList.add("block-grip");
-    grip.draggable = true;
-    grip.addEventListener("dragstart", (event) => {
-      draggedBlockId = block.id;
-      event.dataTransfer.effectAllowed = "move";
-      event.dataTransfer.setData("text/plain", block.id);
-    });
-    grip.addEventListener("dragend", () => { draggedBlockId = null; });
-
-    let content;
-    if (TEXT_BLOCK_TYPES.has(block.type)) content = textContentNode(block);
-    else if (LIST_BLOCK_TYPES.has(block.type)) content = listContentNode(block);
-    else if (block.type === "image") content = imageContentNode(block);
-    else if (block.type === "embed") content = embedContentNode(block);
-    else {
-      content = document.createElement("hr");
-      content.className = "block-divider";
-    }
-    row.append(grip, content, blockControls(block, index), inlineBlockInserter(block));
-    editor.appendChild(row);
-  });
+  editorBlocks.forEach((block) => editor.appendChild(articleBlockElement(block)));
   if (focusId) focusBlock(focusId);
 }
 
 function focusBlock(id, atEnd = false) {
   window.requestAnimationFrame(() => {
-    const row = document.querySelector(`[data-block-id="${CSS.escape(id)}"]`);
-    const target = row?.querySelector("[contenteditable='true'], input");
+    const editor = $("#blockEditor");
+    const row = $("#blockEditor")?.querySelector(`[data-block-id="${CSS.escape(id)}"]`);
+    const target = row?.contentEditable === "false"
+      ? row.querySelector("[contenteditable='true'], input")
+      : row;
     if (!target) return;
-    target.focus();
-    if (atEnd && target.isContentEditable) {
+    if (target instanceof HTMLInputElement) {
+      target.focus();
+    } else {
+      if (target !== row && typeof target.focus === "function") target.focus();
+      else editor.focus();
       const selection = window.getSelection();
       const range = document.createRange();
       range.selectNodeContents(target);
-      range.collapse(false);
+      range.collapse(!atEnd);
       selection.removeAllRanges();
       selection.addRange(range);
     }
   });
-}
-
-function handleTextKeydown(event, block, content) {
-  if (handleFormattingShortcut(event)) return;
-  if (event.key === "Enter" && !event.shiftKey) {
-    event.preventDefault();
-    const selection = window.getSelection();
-    let before = sanitizeInline(content.innerHTML);
-    let after = "";
-    if (selection?.rangeCount && content.contains(selection.anchorNode)) {
-      const range = selection.getRangeAt(0);
-      const beforeRange = document.createRange();
-      beforeRange.selectNodeContents(content);
-      beforeRange.setEnd(range.startContainer, range.startOffset);
-      const afterRange = document.createRange();
-      afterRange.selectNodeContents(content);
-      afterRange.setStart(range.endContainer, range.endOffset);
-      const beforeBox = document.createElement("div");
-      const afterBox = document.createElement("div");
-      beforeBox.appendChild(beforeRange.cloneContents());
-      afterBox.appendChild(afterRange.cloneContents());
-      before = sanitizeInline(beforeBox.innerHTML);
-      after = sanitizeInline(afterBox.innerHTML);
-    }
-    block.html = before;
-    const next = normalizeBlock({ type: "paragraph", html: after });
-    insertBlock(next, block.id);
-    return;
-  }
-  if (event.key === "Backspace" && !plainText(content.innerHTML) && editorBlocks.length > 1) {
-    event.preventDefault();
-    const index = editorBlocks.findIndex((item) => item.id === block.id);
-    const previous = editorBlocks[index - 1];
-    editorBlocks.splice(index, 1);
-    markDirty({ render: false });
-    renderBlocks({ focusId: previous?.id || editorBlocks[0].id });
-  }
 }
 
 function insertBlock(block, afterId = activeBlockId) {
@@ -596,17 +437,6 @@ function insertBlock(block, afterId = activeBlockId) {
   renderBlocks({ focusId: block.id });
 }
 
-function moveBlock(id, direction) {
-  const index = editorBlocks.findIndex((block) => block.id === id);
-  const nextIndex = index + direction;
-  if (index < 0 || nextIndex < 0 || nextIndex >= editorBlocks.length) return;
-  const [block] = editorBlocks.splice(index, 1);
-  editorBlocks.splice(nextIndex, 0, block);
-  activeBlockId = id;
-  markDirty({ render: false });
-  renderBlocks({ focusId: id });
-}
-
 function deleteBlock(id) {
   const index = editorBlocks.findIndex((block) => block.id === id);
   if (index < 0) return;
@@ -615,23 +445,6 @@ function deleteBlock(id) {
   activeBlockId = editorBlocks[Math.max(0, index - 1)]?.id || editorBlocks[0].id;
   markDirty({ render: false });
   renderBlocks({ focusId: activeBlockId });
-}
-
-function changeBlockType(id, nextType) {
-  const block = editorBlocks.find((item) => item.id === id);
-  if (!block || block.type === nextType) return;
-  const text = TEXT_BLOCK_TYPES.has(block.type) ? plainText(block.html) : (block.items || []).map(plainText).join("\n");
-  block.type = nextType;
-  if (TEXT_BLOCK_TYPES.has(nextType)) {
-    block.html = escapeHtml(text).replaceAll("\n", "<br>");
-    delete block.items;
-  } else {
-    block.items = text.split(/\n+/).filter(Boolean).map(escapeHtml);
-    if (!block.items.length) block.items = [""];
-    delete block.html;
-  }
-  markDirty({ render: false });
-  renderBlocks({ focusId: id });
 }
 
 function markDirty({ render = true } = {}) {
@@ -655,41 +468,107 @@ function markDirty({ render = true } = {}) {
 }
 
 function updateEditMeta() {
-  $("#editMeta").textContent = `${wordCount()} words · ${editorBlocks.length} blocks · ${mediaCount()} media`;
+  $("#editMeta").textContent = `${wordCount()} words · ${mediaCount()} media`;
+}
+
+function blockFromArticleElement(element) {
+  const tag = element.tagName.toLowerCase();
+  const id = element.dataset.blockId || uid();
+  element.dataset.blockId = id;
+  if (tag === "figure" || element.dataset.type === "image") {
+    const image = element.querySelector("img");
+    if (!image?.src) return null;
+    element.dataset.type = "image";
+    return normalizeBlock({
+      id,
+      type: "image",
+      url: element.dataset.url || image.getAttribute("src") || image.src,
+      alt: element.dataset.alt || image.alt || "",
+      caption: element.querySelector(".image-caption-inline")?.textContent || "",
+      layout: element.dataset.layout || "regular",
+    });
+  }
+  if (tag === "aside" || element.dataset.type === "embed") {
+    const url = element.dataset.url || element.querySelector("a")?.href || "";
+    if (!url) return null;
+    element.dataset.type = "embed";
+    return normalizeBlock({ id, type: "embed", url, caption: element.querySelector(".embed-caption")?.value || "" });
+  }
+  if (tag === "hr") {
+    element.dataset.type = "divider";
+    return normalizeBlock({ id, type: "divider" });
+  }
+  if (tag === "ul" || tag === "ol") {
+    const type = tag === "ul" ? "bullet_list" : "numbered_list";
+    element.dataset.type = type;
+    return normalizeBlock({
+      id,
+      type,
+      items: [...element.querySelectorAll(":scope > li")].map((item) => sanitizeInline(item.innerHTML)),
+    });
+  }
+  let type = "paragraph";
+  if (tag === "h1" || tag === "h2") type = "heading";
+  else if (/^h[3-6]$/.test(tag)) type = "subheading";
+  else if (tag === "blockquote") type = element.classList.contains("article-editor-pull_quote") ? "pull_quote" : "quote";
+  else if (tag === "pre") type = "code";
+  element.dataset.type = type;
+  let value;
+  if (type === "code") {
+    value = escapeHtml(element.textContent || "");
+  } else {
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    value = inlineHtmlFromFragment(range.cloneContents());
+  }
+  return normalizeBlock({ id, type, html: value });
+}
+
+function articleEditorElements() {
+  const editor = $("#blockEditor");
+  const elements = [];
+  for (const node of [...editor.childNodes]) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      if (!node.textContent.trim()) continue;
+      const paragraph = document.createElement("p");
+      node.replaceWith(paragraph);
+      paragraph.appendChild(node);
+      elements.push(paragraph);
+      continue;
+    }
+    if (!(node instanceof HTMLElement)) continue;
+    if (node.tagName === "DIV" && !node.dataset.blockId) {
+      const nestedBlocks = [...node.children].filter((child) => /^(P|H[1-6]|BLOCKQUOTE|PRE|UL|OL|HR|FIGURE|ASIDE)$/.test(child.tagName));
+      if (nestedBlocks.length) {
+        node.replaceWith(...nestedBlocks);
+        elements.push(...nestedBlocks);
+        continue;
+      }
+    }
+    if (node.tagName === "BR") {
+      const paragraph = document.createElement("p");
+      paragraph.innerHTML = "<br>";
+      node.replaceWith(paragraph);
+      elements.push(paragraph);
+      continue;
+    }
+    elements.push(node);
+  }
+  return elements;
+}
+
+function syncEditorBlocksFromDocument() {
+  const blocks = articleEditorElements().map(blockFromArticleElement).filter(Boolean);
+  if (!blocks.length) blocks.push(normalizeBlock());
+  editorBlocks = blocks;
+  activeBlockId = editorBlocks.find((block) => block.id === activeBlockId)?.id || editorBlocks[0].id;
+  return editorBlocks;
 }
 
 function captureVisibleEditorState() {
-  let changed = false;
-  for (const block of editorBlocks) {
-    const row = document.querySelector(`[data-block-id="${CSS.escape(block.id)}"]`);
-    if (!row) continue;
-    if (TEXT_BLOCK_TYPES.has(block.type)) {
-      const content = row.querySelector(".block-content[contenteditable='true']");
-      const next = sanitizeInline(content?.innerHTML || "");
-      if (next !== block.html) {
-        block.html = next;
-        changed = true;
-      }
-    } else if (LIST_BLOCK_TYPES.has(block.type)) {
-      const next = [...row.querySelectorAll(".list-item")].map((item) => sanitizeInline(item.innerHTML));
-      if (JSON.stringify(next) !== JSON.stringify(block.items || [])) {
-        block.items = next;
-        changed = true;
-      }
-    } else if (block.type === "image") {
-      const caption = row.querySelector(".image-caption")?.value || "";
-      if (caption !== block.caption) {
-        block.caption = caption;
-        changed = true;
-      }
-    } else if (block.type === "embed") {
-      const caption = row.querySelector(".embed-caption")?.value || "";
-      if (caption !== block.caption) {
-        block.caption = caption;
-        changed = true;
-      }
-    }
-  }
+  const previous = JSON.stringify(editorBlocks);
+  syncEditorBlocksFromDocument();
+  const changed = previous !== JSON.stringify(editorBlocks);
   if (changed) {
     editorDirty = true;
     editorRevision += 1;
@@ -717,6 +596,7 @@ function setDraftView(mode) {
   $("#editTab").setAttribute("aria-selected", String(!previewing));
   $("#previewTab").setAttribute("aria-selected", String(previewing));
   if (previewing) renderInlinePreview();
+  if (previewing) hideSelectionToolbar();
 }
 
 async function api(path, options = {}) {
@@ -1075,15 +955,166 @@ function addEmbed() {
   insertBlock(block);
 }
 
-function applyInlineCommand(command) {
+function selectionArticleBlock(node) {
+  const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+  const block = element?.closest?.("#blockEditor > [data-block-id]");
+  return block && $("#blockEditor").contains(block) ? block : null;
+}
+
+function restoreSavedSelection() {
+  if (!savedSelectionRange || !savedSelectionRange.startContainer?.isConnected) return false;
   const selection = window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(savedSelectionRange.cloneRange());
+  return true;
+}
+
+function hideSelectionToolbar() {
+  window.clearTimeout(selectionToolbarTimer);
+  $("#selectionToolbar").classList.add("hidden");
+}
+
+function updateSelectionToolbar() {
+  window.clearTimeout(selectionToolbarTimer);
+  selectionToolbarTimer = window.setTimeout(() => {
+    const selection = window.getSelection();
+    const editor = $("#blockEditor");
+    const active = selectionArticleBlock(selection?.anchorNode);
+    if (active?.dataset.blockId) activeBlockId = active.dataset.blockId;
+    if (!selection?.rangeCount || selection.isCollapsed || !editor.contains(selection.anchorNode) || !editor.contains(selection.focusNode)) {
+      hideSelectionToolbar();
+      return;
+    }
+    const range = selection.getRangeAt(0);
+    const startBlock = selectionArticleBlock(range.startContainer);
+    const endBlock = selectionArticleBlock(range.endContainer);
+    if (!startBlock || !endBlock || startBlock.closest("figure, aside") || endBlock.closest("figure, aside")) {
+      hideSelectionToolbar();
+      return;
+    }
+    savedSelectionRange = range.cloneRange();
+    const rect = range.getBoundingClientRect();
+    const toolbar = $("#selectionToolbar");
+    toolbar.classList.remove("hidden");
+    const width = toolbar.offsetWidth;
+    const height = toolbar.offsetHeight;
+    const left = Math.max(10, Math.min(window.innerWidth - width - 10, rect.left + (rect.width - width) / 2));
+    const above = rect.top - height - 10;
+    const top = above >= 8 ? above : Math.min(window.innerHeight - height - 8, rect.bottom + 10);
+    toolbar.style.left = `${left}px`;
+    toolbar.style.top = `${Math.max(8, top)}px`;
+    updateFormattingState();
+  }, 0);
+}
+
+function inlineHtmlFromFragment(fragment) {
+  const container = document.createElement("div");
+  container.appendChild(fragment.cloneNode(true));
+  container.querySelectorAll(".media-inline-controls, figure, aside, hr").forEach((node) => node.remove());
+  const lineBlocks = [...container.querySelectorAll("div, p, h1, h2, h3, h4, h5, h6, blockquote, pre, li")];
+  lineBlocks.forEach((node, index) => {
+    if (index < lineBlocks.length - 1) node.after(document.createElement("br"));
+  });
+  return sanitizeInline(container.innerHTML)
+    .replace(/^(?:<br>\s*)+|(?:\s*<br>)+$/gi, "")
+    .trim();
+}
+
+function rangeSliceHtml(container, startContainer, startOffset, beforeSelection) {
+  const range = document.createRange();
+  range.selectNodeContents(container);
+  if (beforeSelection) range.setEnd(startContainer, startOffset);
+  else range.setStart(startContainer, startOffset);
+  return inlineHtmlFromFragment(range.cloneContents());
+}
+
+function selectArticleBlock(id) {
+  window.requestAnimationFrame(() => {
+    const element = $("#blockEditor")?.querySelector(`[data-block-id="${CSS.escape(id)}"]`);
+    if (!element) return;
+    $("#blockEditor").focus();
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    savedSelectionRange = range.cloneRange();
+    updateSelectionToolbar();
+  });
+}
+
+function transformSelectedTextToBlock(nextType) {
+  if (!TEXT_BLOCK_TYPES.has(nextType) || !restoreSavedSelection()) return;
+  const selection = window.getSelection();
+  if (!selection?.rangeCount || selection.isCollapsed) return;
+  const range = selection.getRangeAt(0);
+  const startElement = selectionArticleBlock(range.startContainer);
+  const endElement = selectionArticleBlock(range.endContainer);
+  if (!startElement || !endElement) return;
+  syncEditorBlocksFromDocument();
+  const startIndex = editorBlocks.findIndex((block) => block.id === startElement.dataset.blockId);
+  const endIndex = editorBlocks.findIndex((block) => block.id === endElement.dataset.blockId);
+  if (startIndex < 0 || endIndex < startIndex) return;
+  const affected = editorBlocks.slice(startIndex, endIndex + 1);
+  if (affected.some((block) => !TEXT_BLOCK_TYPES.has(block.type))) {
+    setStatus("Select text within paragraphs, headings, or quotes to change its block style.", "error");
+    return;
+  }
+  const selectedHtml = inlineHtmlFromFragment(range.cloneContents());
+  if (!plainText(selectedHtml)) return;
+  const beforeHtml = rangeSliceHtml(startElement, range.startContainer, range.startOffset, true);
+  const afterHtml = rangeSliceHtml(endElement, range.endContainer, range.endOffset, false);
+  const replacement = [];
+  if (plainText(beforeHtml)) {
+    replacement.push(normalizeBlock({ id: affected[0].id, type: affected[0].type, html: beforeHtml }));
+  }
+  const selectedBlock = normalizeBlock({ id: uid(), type: nextType, html: selectedHtml });
+  replacement.push(selectedBlock);
+  if (plainText(afterHtml)) {
+    replacement.push(
+      normalizeBlock({
+        id: beforeHtml || affected.length > 1 ? uid() : affected[affected.length - 1].id,
+        type: affected[affected.length - 1].type,
+        html: afterHtml,
+      }),
+    );
+  }
+  editorBlocks.splice(startIndex, affected.length, ...replacement);
+  activeBlockId = selectedBlock.id;
+  hideSelectionToolbar();
+  markDirty({ render: false });
+  renderBlocks();
+  renderInlinePreview();
+  selectArticleBlock(selectedBlock.id);
+}
+
+function transformSelectionOrInsert(nextType) {
+  const selection = window.getSelection();
+  if (selection?.rangeCount && !selection.isCollapsed && $("#blockEditor").contains(selection.anchorNode) && $("#blockEditor").contains(selection.focusNode)) {
+    savedSelectionRange = selection.getRangeAt(0).cloneRange();
+    transformSelectedTextToBlock(nextType);
+    return;
+  }
+  insertBlock({ id: uid(), type: nextType });
+}
+
+function applyInlineCommand(command) {
+  let selection = window.getSelection();
+  if ((!selection?.rangeCount || !$("#blockEditor").contains(selection.anchorNode)) && restoreSavedSelection()) {
+    selection = window.getSelection();
+  }
   const anchor = selection?.anchorNode;
   const anchorElement = anchor?.nodeType === Node.ELEMENT_NODE ? anchor : anchor?.parentElement;
   const editable = anchorElement?.closest?.("[contenteditable='true']");
   if (!editable || !$("#blockEditor").contains(editable)) return;
   if (command === "createLink") {
+    const commandRange = selection.rangeCount ? selection.getRangeAt(0).cloneRange() : null;
     const url = window.prompt("Link URL:", "https://");
     if (!url) return;
+    if (commandRange?.startContainer?.isConnected) {
+      selection.removeAllRanges();
+      selection.addRange(commandRange);
+    }
     document.execCommand(command, false, url);
   } else {
     document.execCommand(command, false);
@@ -1120,13 +1151,25 @@ function updateFormattingState() {
   const anchorElement = anchor?.nodeType === Node.ELEMENT_NODE ? anchor : anchor?.parentElement;
   const editable = anchorElement?.closest?.("[contenteditable='true']");
   const insideEditor = Boolean(editable && $("#blockEditor").contains(editable));
-  document.querySelectorAll(".format-button").forEach((button) => {
+  const startBlock = selection?.rangeCount ? selectionArticleBlock(selection.getRangeAt(0).startContainer) : null;
+  const endBlock = selection?.rangeCount ? selectionArticleBlock(selection.getRangeAt(0).endContainer) : null;
+  document.querySelectorAll(".format-button, .selection-tool[data-command]").forEach((button) => {
     let active = false;
     if (insideEditor) {
       try {
         active = document.queryCommandState(button.dataset.command);
       } catch {}
     }
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  document.querySelectorAll(".selection-tool[data-block-type]").forEach((button) => {
+    const active = Boolean(
+      insideEditor
+      && startBlock
+      && startBlock === endBlock
+      && startBlock.dataset.type === button.dataset.blockType,
+    );
     button.classList.toggle("active", active);
     button.setAttribute("aria-pressed", String(active));
   });
@@ -1209,22 +1252,22 @@ function schedulePipelineRefresh(delay = refreshDelay()) {
   }, delay);
 }
 
-$("#blockEditor").addEventListener("dragover", (event) => {
-  if (!draggedBlockId) return;
-  event.preventDefault();
+$("#blockEditor").addEventListener("focus", () => {
+  try {
+    document.execCommand("defaultParagraphSeparator", false, "p");
+  } catch {}
 });
-$("#blockEditor").addEventListener("drop", (event) => {
-  if (!draggedBlockId) return;
-  event.preventDefault();
-  const target = event.target.closest(".editor-block");
-  if (!target || target.dataset.blockId === draggedBlockId) return;
-  const from = editorBlocks.findIndex((block) => block.id === draggedBlockId);
-  const to = editorBlocks.findIndex((block) => block.id === target.dataset.blockId);
-  if (from < 0 || to < 0) return;
-  const [block] = editorBlocks.splice(from, 1);
-  editorBlocks.splice(to, 0, block);
-  markDirty({ render: false });
-  renderBlocks({ focusId: draggedBlockId });
+$("#blockEditor").addEventListener("focusin", (event) => {
+  const block = selectionArticleBlock(event.target);
+  if (block?.dataset.blockId) activeBlockId = block.dataset.blockId;
+});
+$("#blockEditor").addEventListener("keydown", (event) => {
+  handleFormattingShortcut(event);
+});
+$("#blockEditor").addEventListener("input", () => {
+  syncEditorBlocksFromDocument();
+  if (!$("#blockEditor").children.length) renderBlocks({ focusId: editorBlocks[0].id });
+  markDirty();
 });
 
 $("#ingestButton").addEventListener("click", ingest);
@@ -1248,8 +1291,14 @@ $("#editor").addEventListener("submit", async (event) => {
   }
 });
 $("#addBlockButton").addEventListener("click", () => insertBlock(normalizeBlock({ id: uid(), type: $("#blockTypeSelect").value })));
-$("#pullQuoteButton").addEventListener("click", () => insertBlock({ id: uid(), type: "pull_quote" }));
-$("#quoteButton").addEventListener("click", () => insertBlock({ id: uid(), type: "quote" }));
+$("#pullQuoteButton").addEventListener("mousedown", (event) => {
+  event.preventDefault();
+  transformSelectionOrInsert("pull_quote");
+});
+$("#quoteButton").addEventListener("mousedown", (event) => {
+  event.preventDefault();
+  transformSelectionOrInsert("quote");
+});
 $("#dividerButton").addEventListener("click", () => insertBlock({ id: uid(), type: "divider" }));
 $("#imageButton").addEventListener("click", () => openMediaDialog());
 $("#embedButton").addEventListener("click", addEmbed);
@@ -1260,7 +1309,24 @@ document.querySelectorAll(".format-button").forEach((button) => {
     applyInlineCommand(button.dataset.command);
   });
 });
-document.addEventListener("selectionchange", updateFormattingState);
+document.addEventListener("selectionchange", () => {
+  updateFormattingState();
+  updateSelectionToolbar();
+});
+document.querySelectorAll(".selection-tool[data-command]").forEach((button) => {
+  button.addEventListener("mousedown", (event) => {
+    event.preventDefault();
+  });
+  button.addEventListener("click", () => applyInlineCommand(button.dataset.command));
+});
+document.querySelectorAll(".selection-tool[data-block-type]").forEach((button) => {
+  button.addEventListener("mousedown", (event) => {
+    event.preventDefault();
+  });
+  button.addEventListener("click", () => transformSelectedTextToBlock(button.dataset.blockType));
+});
+window.addEventListener("resize", hideSelectionToolbar);
+window.addEventListener("scroll", hideSelectionToolbar, true);
 $("#mediaForm").addEventListener("submit", submitMedia);
 $("#mediaFile").addEventListener("change", () => {
   const file = $("#mediaFile").files[0];

@@ -35,7 +35,7 @@ No X credential is required. The API base can be overridden with `FXTWITTER_API_
 
 ## Editing
 
-The dashboard supports paragraph, heading, subheading, quote, list, code, divider, image, and URL embed blocks. It also supports inline formatting and links, image upload or remote image insertion, block reordering, autosave, and local preview.
+The dashboard presents the article body as one continuous rich-text surface. Highlighting text opens a contextual toolbar for bold, italic, underline, strikethrough, links, headings, quotes, and pull quotes; block transformations split the exact selection while preserving the surrounding copy. The underlying paragraph, heading, list, code, divider, image, and embed structure remains intact for exact autosave, preview, and Substack publishing.
 
 Existing pipeline records are backfilled once from their X URLs. The migration preserves publication state and Substack links, stores a pre-migration backup under `data/backups/`, and replaces content only after ID, title, and article-copy verification. The same sanitized block document powers preview, RSS, HTML, and CSV output.
 

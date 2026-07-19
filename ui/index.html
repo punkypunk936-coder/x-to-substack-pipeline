@@ -146,6 +146,23 @@
     </section>
   </main>
 
+  <div id="selectionToolbar" class="selection-toolbar hidden" role="toolbar" aria-label="Format selected text">
+    <div class="selection-inline-tools">
+      <button type="button" class="selection-tool" data-command="bold" title="Bold" aria-label="Bold"><strong>B</strong></button>
+      <button type="button" class="selection-tool" data-command="italic" title="Italic" aria-label="Italic"><em>I</em></button>
+      <button type="button" class="selection-tool" data-command="underline" title="Underline" aria-label="Underline"><u>U</u></button>
+      <button type="button" class="selection-tool" data-command="strikeThrough" title="Strikethrough" aria-label="Strikethrough"><s>S</s></button>
+      <button type="button" class="selection-tool selection-link-tool" data-command="createLink" title="Add link" aria-label="Add link">Link</button>
+    </div>
+    <div class="selection-block-tools">
+      <button type="button" class="selection-tool selection-text-tool" data-block-type="paragraph">Text</button>
+      <button type="button" class="selection-tool selection-text-tool" data-block-type="heading">Heading</button>
+      <button type="button" class="selection-tool selection-text-tool" data-block-type="subheading">Subhead</button>
+      <button type="button" class="selection-tool selection-text-tool" data-block-type="quote">Quote</button>
+      <button type="button" class="selection-tool selection-text-tool" data-block-type="pull_quote">Pull quote</button>
+    </div>
+  </div>
+
   <dialog id="mediaDialog" class="media-dialog">
     <form id="mediaForm" class="dialog-form">
       <div class="dialog-header">
