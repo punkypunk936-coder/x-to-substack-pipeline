@@ -58,10 +58,33 @@ function configureConnections(data) {
 
   ingestButton.disabled = !ingestConfigured;
   ingestButton.title = ingestMessage;
-  draftButton.disabled = !publishConfigured;
   draftButton.title = publishMessage;
-  publishButton.disabled = !publishConfigured;
   publishButton.title = publishMessage;
+  configureDraftActions();
+}
+
+function isPublishedDraft(draft = currentDraft) {
+  return String(draft?.status || "draft") === "published";
+}
+
+function configureDraftActions() {
+  const hasDraft = Boolean(currentDraft);
+  const published = isPublishedDraft();
+  const draftButton = $("#substackDraftButton");
+  const publishButton = $("#publishButton");
+  const viewLiveButton = $("#viewLiveButton");
+  const publicUrl = published ? String(currentDraft?.substack_url || "") : "";
+
+  $("#draftKind").textContent = published ? "Published article" : "Current draft";
+  draftButton.classList.toggle("hidden", published);
+  draftButton.disabled = !publishConfigured || !hasDraft || published;
+  publishButton.textContent = published ? "Update live post" : "Publish now";
+  publishButton.classList.toggle("danger-button", !published);
+  publishButton.classList.toggle("update-button", published);
+  publishButton.disabled = !publishConfigured || !hasDraft;
+  viewLiveButton.classList.toggle("hidden", !publicUrl);
+  if (publicUrl) viewLiveButton.href = publicUrl;
+  else viewLiveButton.removeAttribute("href");
 }
 
 function uid() {
@@ -221,6 +244,7 @@ function renderDraft(draft) {
   const warnings = draft.warnings || [];
   $("#warningLine").textContent = warnings.length ? warnings.join(" ") : "";
   $("#publishLine").textContent = "";
+  configureDraftActions();
 }
 
 function formatSyncTime(value) {
@@ -266,6 +290,8 @@ function renderPipeline(pipeline, { force = false } = {}) {
   const publishedItems = (pipeline.items || []).filter((item) => item.status === "published");
 
   const renderItem = (item, list) => {
+    const row = document.createElement("div");
+    row.className = "draft-item-row";
     const button = document.createElement("button");
     button.type = "button";
     button.className = "draft-item";
@@ -290,14 +316,20 @@ function renderPipeline(pipeline, { force = false } = {}) {
     meta.textContent = `${item.word_count || 0} words · ${item.media_count || 0} media`;
 
     button.append(status, title, meta);
-    button.addEventListener("click", () => {
-      if (item.status === "published" && item.substack_url) {
-        window.open(item.substack_url, "_blank", "noopener");
-        return;
-      }
-      selectDraft(item.id);
-    });
-    list.appendChild(button);
+    button.addEventListener("click", () => selectDraft(item.id));
+    row.appendChild(button);
+    if (item.status === "published" && item.substack_url) {
+      const liveLink = document.createElement("a");
+      liveLink.className = "draft-live-link";
+      liveLink.href = item.substack_url;
+      liveLink.target = "_blank";
+      liveLink.rel = "noopener noreferrer";
+      liveLink.textContent = "View";
+      liveLink.title = "View live article";
+      liveLink.setAttribute("aria-label", `View ${item.title || "article"} live`);
+      row.appendChild(liveLink);
+    }
+    list.appendChild(row);
   };
 
   activeItems.forEach((item) => renderItem(item, draftList));
@@ -789,14 +821,21 @@ async function sendToSubstack(mode) {
     setStatus("Create a draft first.", "error");
     return;
   }
-  const button = mode === "publish" ? $("#publishButton") : $("#substackDraftButton");
+  const updatingPublishedPost = isPublishedDraft();
+  if (updatingPublishedPost && mode !== "publish") {
+    setStatus("Published articles update through the live-post action.", "error");
+    return;
+  }
   $("#publishButton").disabled = true;
   $("#substackDraftButton").disabled = true;
   try {
     captureVisibleEditorState();
     await prepareSavedDraft();
     if (mode === "publish") {
-      const confirmed = window.confirm(`Publish “${currentDraft.title}” to Everyone now? Substack will also send it by email and in the Substack app.`);
+      const message = updatingPublishedPost
+        ? `Update “${currentDraft.title}” on Substack now? The live article will change without sending another email.`
+        : `Publish “${currentDraft.title}” to Everyone now? Substack will also send it by email and in the Substack app.`;
+      const confirmed = window.confirm(message);
       if (!confirmed) return;
     }
     captureVisibleEditorState();
@@ -807,8 +846,19 @@ async function sendToSubstack(mode) {
       blocks: JSON.parse(JSON.stringify(editorBlocks)),
     };
     $("#editor").inert = true;
-    $("#publishLine").textContent = mode === "publish" ? "Publishing to Substack..." : "Saving a Substack draft in the background...";
-    setStatus(mode === "publish" ? "Publishing the saved rich draft..." : "Sending the saved rich draft to Substack...", "busy");
+    $("#publishLine").textContent = updatingPublishedPost
+      ? "Updating and verifying the live Substack post..."
+      : mode === "publish"
+        ? "Publishing to Substack..."
+        : "Saving a Substack draft in the background...";
+    setStatus(
+      updatingPublishedPost
+        ? "Updating the live article and checking the public result..."
+        : mode === "publish"
+          ? "Publishing the saved rich draft..."
+          : "Sending the saved rich draft to Substack...",
+      "busy",
+    );
     const result = await api("/api/publish", {
       method: "POST",
       body: JSON.stringify({
@@ -818,6 +868,12 @@ async function sendToSubstack(mode) {
       }),
     });
     if (result.pipeline) renderPipeline(result.pipeline);
+    if (
+      result.status === "published_verified"
+      && String(result.draft_id || "") === String(currentDraft?.id || "")
+    ) {
+      await openDraft(result.draft_id);
+    }
     $("#publishLine").textContent = result.message || result.status || "Substack step finished.";
     setStatus(result.message || "Substack step finished.", result.ok ? "ok" : "error");
   } catch (error) {
@@ -830,8 +886,7 @@ async function sendToSubstack(mode) {
     }
   } finally {
     $("#editor").inert = false;
-    $("#publishButton").disabled = !publishConfigured;
-    $("#substackDraftButton").disabled = !publishConfigured;
+    configureDraftActions();
   }
 }
 

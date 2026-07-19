@@ -1787,17 +1787,6 @@ def mark_selected_published(url: Any = None, draft_id: Any = None) -> None:
                 if published_url:
                     item["substack_url"] = published_url
                 break
-        if str(pipeline.get("selected_id") or "") == selected_id:
-            active = [item for item in pipeline["items"] if item.get("status") != "published"]
-            next_selected = max(
-                active,
-                key=lambda item: (
-                    int(str(item.get("id") or "0")) if str(item.get("id") or "").isdigit() else 0,
-                    str(item.get("discovered_at") or ""),
-                ),
-                default=None,
-            )
-            pipeline["selected_id"] = next_selected.get("id") if next_selected else None
         write_pipeline(pipeline)
         current = current_draft()
         if current and str(current.get("id") or "") == selected_id:
@@ -2117,32 +2106,41 @@ def reconcile_substack_publications() -> Dict[str, Any]:
                     "source": post.get("source"),
                 }
             )
-            already_linked = item.get("status") == "published" and item.get("substack_url") == post["url"]
+            was_published = item.get("status") == "published"
+            already_linked = was_published and item.get("substack_url") == post["url"]
             next_published_at = (
                 item.get("published_at")
                 if already_linked and item.get("published_at")
                 else post.get("published_at") or item.get("published_at") or now_iso()
             )
+            next_post_id = int(post.get("post_id") or 0) or item_substack_post_id(item)
+            next_uuid = str(post.get("uuid") or item.get("substack_uuid") or "") or None
+            next_slug = str(post.get("slug") or item.get("substack_slug") or "") or None
             if (
-                item.get("status") != "published"
+                not was_published
                 or item.get("substack_url") != post["url"]
                 or item.get("published_at") != next_published_at
+                or item_substack_post_id(item) != next_post_id
+                or (item.get("substack_uuid") or None) != next_uuid
+                or (item.get("substack_slug") or None) != next_slug
             ):
                 item["status"] = "published"
                 item["substack_url"] = post["url"]
-                if post.get("post_id"):
-                    item["substack_post_id"] = post["post_id"]
-                if post.get("uuid"):
-                    item["substack_uuid"] = post["uuid"]
-                if post.get("slug"):
-                    item["substack_slug"] = post["slug"]
+                if next_post_id:
+                    item["substack_post_id"] = next_post_id
+                    item["substack_draft_url"] = f"{substack_publication_url()}/publish/post/{next_post_id}"
+                if next_uuid:
+                    item["substack_uuid"] = next_uuid
+                if next_slug:
+                    item["substack_slug"] = next_slug
                 item["published_at"] = next_published_at
                 item["updated_at"] = now_iso()
-                updated.append(draft_id)
+                if not was_published:
+                    updated.append(draft_id)
                 changed = True
         selected_id = str(pipeline.get("selected_id") or "")
         selected = next((item for item in pipeline["items"] if str(item.get("id") or "") == selected_id), None)
-        if not selected or selected.get("status") == "published":
+        if not selected:
             active = [item for item in pipeline["items"] if item.get("status") != "published"]
             next_selected = max(
                 active,
@@ -3037,6 +3035,9 @@ def save_substack_draft(
     checkpoint: Optional[Any] = None,
 ) -> Dict[str, Any]:
     publication_url = substack_publication_url()
+    post_id = substack_draft_id(draft)
+    if str(draft.get("status") or "draft") == "published" and not post_id:
+        raise ValueError("This published article is not linked to its Substack post yet. Run Sync all, then retry; no duplicate was created.")
     image_urls = upload_substack_images(session, draft)
     document, cover_url = substack_document(draft, image_urls)
     payload: Dict[str, Any] = {
@@ -3051,7 +3052,6 @@ def save_substack_draft(
         "cover_image": cover_url,
     }
 
-    post_id = substack_draft_id(draft)
     existing: Optional[Dict[str, Any]] = None
     if post_id:
         response = session.get(f"{publication_url}/api/v1/drafts/{post_id}", timeout=30)

@@ -176,6 +176,15 @@ button:disabled {
   background: #6f1f1f;
 }
 
+.update-button {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.update-button:hover {
+  background: var(--accent-dark);
+}
+
 .button-link.secondary {
   border-color: var(--line);
   background: #f9faf8;
@@ -429,6 +438,12 @@ button:disabled {
   border-top: 1px solid var(--line);
 }
 
+.draft-item-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  border-bottom: 1px solid var(--line);
+}
+
 .draft-item {
   display: grid;
   width: 100%;
@@ -437,13 +452,30 @@ button:disabled {
   gap: 5px 8px;
   justify-items: start;
   border: 0;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 0;
   border-radius: 0;
   background: transparent;
   color: var(--ink);
   padding: 14px 15px;
   text-align: left;
   white-space: normal;
+}
+
+.draft-live-link {
+  display: inline-flex;
+  align-items: center;
+  align-self: stretch;
+  border-left: 1px solid var(--line);
+  padding: 0 11px;
+  color: var(--accent);
+  font-size: 0.75rem;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.draft-live-link:hover {
+  background: #ffffff;
+  color: var(--accent-dark);
 }
 
 .draft-item:hover,

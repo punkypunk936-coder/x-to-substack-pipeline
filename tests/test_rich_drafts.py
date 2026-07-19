@@ -521,6 +521,24 @@ class RichDraftTests(unittest.TestCase):
             else:
                 os.environ["SUBSTACK_PUBLICATION_URL"] = previous_publication_url
 
+    def test_published_post_without_identity_never_creates_a_duplicate(self) -> None:
+        previous_upload = server.upload_substack_images
+        try:
+            server.upload_substack_images = lambda _session, _draft: self.fail("Media upload must not start without a verified post ID.")
+            with self.assertRaisesRegex(ValueError, "not linked to its Substack post"):
+                server.save_substack_draft(
+                    object(),
+                    {"id": 7},
+                    {
+                        "status": "published",
+                        "title": "Existing live post",
+                        "substack_url": "https://example.substack.com/p/existing-live-post",
+                        "blocks": [{"type": "paragraph", "html": "Edited copy."}],
+                    },
+                )
+        finally:
+            server.upload_substack_images = previous_upload
+
     def test_x_profile_images_are_not_article_blocks(self) -> None:
         blocks = server.normalize_blocks(
             {
@@ -587,7 +605,7 @@ class RichDraftTests(unittest.TestCase):
             server.fetch_substack_feed_publications = previous_feed_fetch
             server.fetch_substack_archive_publications = previous_archive_fetch
 
-    def test_reconciliation_retires_published_selection(self) -> None:
+    def test_reconciliation_keeps_an_explicitly_selected_published_article_editable(self) -> None:
         previous_pipeline_path = server.DRAFT_PIPELINE_JSON
         previous_fetch = server.fetch_substack_publications
         try:
@@ -626,7 +644,7 @@ class RichDraftTests(unittest.TestCase):
                 pipeline = json.loads(server.DRAFT_PIPELINE_JSON.read_text())
 
                 self.assertEqual(result["updated"], ["200"])
-                self.assertEqual(pipeline["selected_id"], "201")
+                self.assertEqual(pipeline["selected_id"], "200")
                 self.assertEqual(pipeline["items"][0]["status"], "published")
                 self.assertEqual(pipeline["items"][0]["substack_url"], "https://manvinder.substack.com/p/everyones-a-trader")
         finally:
@@ -672,6 +690,59 @@ class RichDraftTests(unittest.TestCase):
         finally:
             server.DRAFT_PIPELINE_JSON = previous_pipeline_path
             server.fetch_substack_publications = previous_fetch
+
+    def test_reconciliation_backfills_a_published_posts_edit_identity(self) -> None:
+        previous_pipeline_path = server.DRAFT_PIPELINE_JSON
+        previous_fetch = server.fetch_substack_publications
+        previous_publication_url = os.environ.get("SUBSTACK_PUBLICATION_URL")
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                server.DRAFT_PIPELINE_JSON = Path(directory) / "pipeline.json"
+                server.DRAFT_PIPELINE_JSON.write_text(
+                    json.dumps(
+                        {
+                            "selected_id": "published",
+                            "items": [
+                                {
+                                    "id": "published",
+                                    "title": "Already published",
+                                    "status": "published",
+                                    "substack_url": "https://example.substack.com/p/already-published",
+                                    "published_at": "2026-07-16T08:22:11+00:00",
+                                }
+                            ],
+                        }
+                    )
+                )
+                os.environ["SUBSTACK_PUBLICATION_URL"] = "https://example.substack.com"
+                server.fetch_substack_publications = lambda: [
+                    {
+                        "post_id": 42,
+                        "uuid": "post-uuid",
+                        "slug": "already-published",
+                        "title": "Already published",
+                        "url": "https://example.substack.com/p/already-published",
+                        "published_at": "2026-07-16T08:22:11+00:00",
+                        "source": "archive_api",
+                    }
+                ]
+
+                result = server.reconcile_substack_publications()
+                pipeline = json.loads(server.DRAFT_PIPELINE_JSON.read_text())
+                article = pipeline["items"][0]
+
+                self.assertEqual(result["updated"], [])
+                self.assertEqual(pipeline["selected_id"], "published")
+                self.assertEqual(article["substack_post_id"], 42)
+                self.assertEqual(article["substack_draft_url"], "https://example.substack.com/publish/post/42")
+                self.assertEqual(article["substack_slug"], "already-published")
+        finally:
+            server.DRAFT_PIPELINE_JSON = previous_pipeline_path
+            server.fetch_substack_publications = previous_fetch
+            if previous_publication_url is None:
+                os.environ.pop("SUBSTACK_PUBLICATION_URL", None)
+            else:
+                os.environ["SUBSTACK_PUBLICATION_URL"] = previous_publication_url
 
     def test_x_high_water_mark_accepts_only_newer_articles(self) -> None:
         existing = {"200", "195"}
